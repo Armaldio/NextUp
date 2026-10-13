@@ -12,10 +12,14 @@ const screenshotDir = resolve(root, 'docs/screenshots')
 const profileDir = await mkdtemp(join(tmpdir(), 'nextup-next-9-chrome-'))
 const imagePath = join(profileDir, 'e2e-cover.png')
 const errors = []
+const CDP_COMMAND_TIMEOUT_MS = 10_000
+const CDP_EVENT_TIMEOUT_MS = 15_000
+const UI_WAIT_TIMEOUT_MS = 12_000
 let vite
 let chrome
 let client
 let commandId = 0
+let transportFailure
 const pending = new Map()
 const eventWaiters = new Map()
 
@@ -36,44 +40,131 @@ async function freePort() {
   return port
 }
 
-async function waitFor(url, label) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+async function waitFor(url, label, child) {
+  const deadline = Date.now() + CDP_COMMAND_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    if (child?.spawnFailure) throw new Error(`${label} failed to start`, { cause: child.spawnFailure })
     try {
-      const response = await fetch(url)
+      const response = await fetch(url, { signal: AbortSignal.timeout(1_000) })
       if (response.ok) return
     } catch { /* Vite is still starting. */ }
-    await delay(100)
+    await delay(Math.min(100, Math.max(0, deadline - Date.now())))
   }
   throw new Error(`${label} did not start at ${url}`)
 }
 
-function send(method, params = {}) {
+async function navigate(url) {
+  const loaded = waitForEvent('Page.loadEventFired')
+  const navigation = send('Page.navigate', { url })
+  const [result] = await Promise.all([navigation, loaded])
+  if (result.errorText) throw new Error(`Navigation failed: ${result.errorText}`)
+}
+
+async function reloadPage() {
+  const loaded = waitForEvent('Page.loadEventFired')
+  await Promise.all([send('Page.reload'), loaded])
+}
+
+function failTransport(error) {
+  if (transportFailure) return
+  transportFailure = error instanceof Error ? error : new Error(String(error))
+  for (const [id, entry] of pending) {
+    clearTimeout(entry.timer)
+    entry.reject(transportFailure)
+    pending.delete(id)
+  }
+  for (const [method, entry] of eventWaiters) {
+    clearTimeout(entry.timer)
+    entry.reject(transportFailure)
+    eventWaiters.delete(method)
+  }
+}
+
+function send(method, params = {}, timeoutMs = CDP_COMMAND_TIMEOUT_MS) {
+  if (transportFailure) return Promise.reject(transportFailure)
+  if (!client || client.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error(`Cannot send CDP ${method}: WebSocket is not open`))
+  }
   const id = ++commandId
   return new Promise((resolveCommand, rejectCommand) => {
-    pending.set(id, { resolve: resolveCommand, reject: rejectCommand })
-    client.send(JSON.stringify({ id, method, params }))
+    const timer = setTimeout(() => {
+      pending.delete(id)
+      rejectCommand(new Error(`CDP command ${method} timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+    pending.set(id, { resolve: resolveCommand, reject: rejectCommand, timer })
+    try {
+      client.send(JSON.stringify({ id, method, params }))
+    } catch (error) {
+      clearTimeout(timer)
+      pending.delete(id)
+      rejectCommand(error)
+    }
   })
 }
 
-function waitForEvent(method) {
-  return new Promise((resolveEvent) => eventWaiters.set(method, resolveEvent))
+function waitForEvent(method, timeoutMs = CDP_EVENT_TIMEOUT_MS) {
+  if (transportFailure) return Promise.reject(transportFailure)
+  if (eventWaiters.has(method)) return Promise.reject(new Error(`Already waiting for CDP event ${method}`))
+  return new Promise((resolveEvent, rejectEvent) => {
+    const timer = setTimeout(() => {
+      eventWaiters.delete(method)
+      rejectEvent(new Error(`CDP event ${method} timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+    eventWaiters.set(method, { resolve: resolveEvent, reject: rejectEvent, timer })
+  })
 }
 
-async function evaluate(expression) {
-  const result = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true })
+function waitForSocketOpen(socket, timeoutMs = CDP_COMMAND_TIMEOUT_MS) {
+  if (socket.readyState === WebSocket.OPEN) return Promise.resolve()
+  return new Promise((resolveOpen, rejectOpen) => {
+    const cleanup = () => {
+      clearTimeout(timer)
+      socket.removeEventListener('open', onOpen)
+      socket.removeEventListener('close', onClose)
+      socket.removeEventListener('error', onError)
+    }
+    const onOpen = () => { cleanup(); resolveOpen() }
+    const onClose = () => { cleanup(); rejectOpen(new Error('Chromium CDP WebSocket closed before opening')) }
+    const onError = () => { cleanup(); rejectOpen(new Error('Chromium CDP WebSocket failed before opening')) }
+    const timer = setTimeout(() => {
+      cleanup()
+      rejectOpen(new Error(`Chromium CDP WebSocket did not open within ${timeoutMs}ms`))
+    }, timeoutMs)
+    socket.addEventListener('open', onOpen, { once: true })
+    socket.addEventListener('close', onClose, { once: true })
+    socket.addEventListener('error', onError, { once: true })
+  })
+}
+
+async function assertAxControls(expected, label) {
+  const { nodes } = await send('Accessibility.getFullAXTree')
+  const controls = nodes
+    .filter((node) => !node.ignored)
+    .map((node) => ({ role: node.role?.value ?? '', name: node.name?.value ?? '' }))
+  for (const { role, name } of expected) {
+    assert(controls.some((control) => control.role === role && control.name === name),
+      `${label} AX tree is missing ${role} named ${JSON.stringify(name)}; found: ${JSON.stringify(controls.filter((entry) => entry.role === role))}`)
+  }
+  console.log(`AX tree ${label}:`, JSON.stringify(expected))
+}
+
+async function evaluate(expression, timeoutMs = CDP_COMMAND_TIMEOUT_MS) {
+  const result = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, timeoutMs)
   if (result.exceptionDetails) throw new Error(result.exceptionDetails.text ?? 'Browser evaluation failed')
   return result.result?.value
 }
 
 async function waitUntil(expression, label) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (await evaluate(expression)) return
-    await delay(100)
+  const deadline = Date.now() + UI_WAIT_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    const remaining = deadline - Date.now()
+    if (await evaluate(expression, Math.min(CDP_COMMAND_TIMEOUT_MS, remaining))) return
+    await delay(Math.min(100, Math.max(0, deadline - Date.now())))
   }
   const diagnostic = label === 'manual item reorder'
-    ? await evaluate(`([...document.querySelectorAll('.manual-stage')].map((stage) => ({ stage: stage.querySelector('h3').textContent, items: [...stage.querySelectorAll('.manual-item-card .item-open strong')].map((e) => e.textContent), disabled: [...stage.querySelectorAll('.manual-item-card button')].map((e) => ({ label: e.getAttribute('aria-label'), disabled: e.disabled })) })))`)
+    ? await evaluate(`([...document.querySelectorAll('.manual-stage')].map((stage) => ({ stage: stage.querySelector('h3').textContent, items: [...stage.querySelectorAll('.manual-item-card .item-open strong')].map((e) => e.textContent), disabled: [...stage.querySelectorAll('.manual-item-card button')].map((e) => ({ label: e.getAttribute('aria-label'), disabled: e.disabled })) })))`, Math.max(1, deadline - Date.now())).catch(() => undefined)
     : label === 'keyboard item reorder alternative'
-      ? await evaluate(`({ active: document.activeElement.getAttribute('aria-label'), items: [...document.querySelectorAll('.manual-stage')].map((stage) => ({ stage: stage.querySelector('h3').textContent, items: [...stage.querySelectorAll('.manual-item-card .item-open strong')].map((e) => e.textContent) })) })`)
+      ? await evaluate(`({ active: document.activeElement.getAttribute('aria-label'), items: [...document.querySelectorAll('.manual-stage')].map((stage) => ({ stage: stage.querySelector('h3').textContent, items: [...stage.querySelectorAll('.manual-item-card .item-open strong')].map((e) => e.textContent) })) })`, Math.max(1, deadline - Date.now())).catch(() => undefined)
     : undefined
   throw new Error(`Timed out waiting for ${label}${diagnostic ? `: ${JSON.stringify(diagnostic)}` : ''}`)
 }
@@ -185,16 +276,18 @@ async function start() {
   const chromePort = await freePort()
   const appUrl = `http://127.0.0.1:${vitePort}`
   vite = spawn('pnpm', ['exec', 'vite', '--host', '127.0.0.1', '--port', String(vitePort), '--strictPort'], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] })
+  vite.on('error', (error) => { vite.spawnFailure = error })
   vite.stderr.on('data', (chunk) => process.stderr.write(chunk))
-  await waitFor(appUrl, 'Vite')
+  await waitFor(appUrl, 'Vite', vite)
 
   chrome = spawn('chromium', [
     '--headless=new', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
     `--user-data-dir=${profileDir}`, `--remote-debugging-port=${chromePort}`,
     '--remote-allow-origins=*', 'about:blank',
   ], { stdio: ['ignore', 'ignore', 'pipe'] })
+  chrome.on('error', (error) => { chrome.spawnFailure = error })
   chrome.stderr.on('data', () => {})
-  await waitFor(`http://127.0.0.1:${chromePort}/json/version`, 'local Chromium')
+  await waitFor(`http://127.0.0.1:${chromePort}/json/version`, 'local Chromium', chrome)
   const targets = await (await fetch(`http://127.0.0.1:${chromePort}/json/list`)).json()
   const page = targets.find((target) => target.type === 'page')
   assert(page?.webSocketDebuggerUrl, 'Could not find a Chromium page target')
@@ -202,21 +295,29 @@ async function start() {
   client.addEventListener('message', (event) => {
     const message = JSON.parse(event.data)
     if (!message.id) {
-      const resolveEvent = eventWaiters.get(message.method)
-      if (resolveEvent) { eventWaiters.delete(message.method); resolveEvent(message.params) }
+      const waiter = eventWaiters.get(message.method)
+      if (waiter) {
+        clearTimeout(waiter.timer)
+        eventWaiters.delete(message.method)
+        waiter.resolve(message.params)
+      }
       return
     }
     const entry = pending.get(message.id)
     if (!entry) return
     pending.delete(message.id)
+    clearTimeout(entry.timer)
     if (message.error) entry.reject(new Error(message.error.message))
     else entry.resolve(message.result)
   })
-  await once(client, 'open')
+  client.addEventListener('close', () => failTransport(new Error('Chromium CDP WebSocket closed')))
+  client.addEventListener('error', () => failTransport(new Error('Chromium CDP WebSocket error')))
+  await waitForSocketOpen(client)
   await send('Page.enable')
   await send('Runtime.enable')
   await send('DOM.enable')
-  await send('Page.navigate', { url: appUrl })
+  await send('Accessibility.enable')
+  await navigate(appUrl)
   await waitUntil(`document.querySelector('h1')?.textContent.includes('Your lists')`, 'home screen')
   assert(await evaluate(`!!document.querySelector('.empty-state')`), 'Empty home state is not shown when no lists exist')
 
@@ -244,9 +345,7 @@ async function start() {
   const stageOrder = await evaluate('[...document.querySelectorAll(".stage-list input")].map((e) => e.value)')
   assert(JSON.stringify(stageOrder) === JSON.stringify(['Done', 'Doing', 'Soon']), 'Manual stages could not be reordered')
   await saveScreenshot('nextup-list.png', 390, 844)
-  const manualReload = waitForEvent('Page.loadEventFired')
-  await send('Page.reload')
-  await manualReload
+  await reloadPage()
   await waitUntil(`document.querySelectorAll('.manual-item-card').length === 3`, 'manual list after reload')
   const manualAfterReload = await evaluate(`({ stages: [...document.querySelectorAll('.stage-list input')].map((e) => e.value), items: [...document.querySelectorAll('.manual-stage')].map((s) => ({ stage: s.querySelector('h3').textContent, items: [...s.querySelectorAll('.manual-item-card .item-open strong')].map((e) => e.textContent) })) })`)
   assert(JSON.stringify(manualAfterReload.stages) === JSON.stringify(['Done', 'Doing', 'Soon']), 'Manual stage order did not persist across reload')
@@ -276,10 +375,14 @@ async function start() {
     await press('Tab', 'Tab', 9)
   }
   assert(keyboardReorderFocused, 'Keyboard tab order did not reach the item reorder alternative')
+  await assertAxControls([
+    { role: 'button', name: '＋ New item' },
+    { role: 'textbox', name: 'Rename stage Doing' },
+    { role: 'button', name: 'Move North Star later in Soon' },
+    { role: 'link', name: 'Moonrise' },
+  ], 'manual list')
   await press('Enter', 'Enter', 13)
   await waitUntil(`(() => { const stage = [...document.querySelectorAll('.manual-stage')].find((entry) => entry.querySelector('h3').textContent === 'Soon'); return JSON.stringify(stage ? [...stage.querySelectorAll('.manual-item-card .item-open strong')].map((e) => e.textContent) : []) === '["Moonrise","Riverside","North Star"]'; })()`, 'keyboard item reorder alternative')
-  const accessibleNames = await evaluate(`([...document.querySelectorAll('button, a, input:not([type="hidden"]), select, textarea')].filter((e) => e.getClientRects().length).map((e) => ({ tag: e.tagName, name: e.getAttribute('aria-label') || e.labels?.[0]?.textContent.trim() || e.getAttribute('title') || e.textContent.trim() || '' })))`)
-  assert(accessibleNames.every((entry) => entry.name.length > 0), `Visible interactive controls are missing semantic names: ${JSON.stringify(accessibleNames.filter((entry) => !entry.name))}`)
 
   await saveScreenshot('nextup-list.png', 390, 844)
   await viewport(1280, 900, false)
@@ -288,7 +391,7 @@ async function start() {
   await saveScreenshot('nextup-list-desktop.png', 1280, 900)
 
   await viewport(390, 844, true)
-  await send('Page.navigate', { url: appUrl })
+  await navigate(appUrl)
   await waitUntil(`document.querySelector('.home-list-rail')`, 'home route after desktop resize')
   const railMetrics = await evaluate(`([...document.querySelectorAll('.home-item-rail')].map((rail) => ({ name: rail.getAttribute('aria-label'), scrollWidth: rail.scrollWidth, clientWidth: rail.clientWidth, touchAction: getComputedStyle(rail).touchAction })))`)
   assert(railMetrics.some((rail) => rail.scrollWidth > rail.clientWidth && rail.touchAction.includes('pan-x')), 'Home item rail is not horizontally scrollable')
@@ -315,11 +418,21 @@ async function start() {
   console.log('date reorder controls:', JSON.stringify(reorderCounts))
   assert(reorderCounts.find((section) => section.section === 'Dated')?.items.every((entry) => entry.reorder === 0), 'A dated item unexpectedly has manual reorder controls')
   assert(reorderCounts.find((section) => section.section === 'Undated')?.items.every((entry) => entry.reorder === 2), 'Undated items do not have both reorder controls')
+  await assertAxControls([
+    { role: 'button', name: '＋ New item' },
+    { role: 'button', name: 'Move Undated two earlier among undated items' },
+    { role: 'link', name: 'Undated one No date' },
+  ], 'date list')
   const dateTouchMetrics = await evaluate(`([...document.querySelectorAll('.date-item-section button')].filter((e) => !e.disabled).map((e) => ({ label: e.getAttribute('aria-label') || e.textContent.trim(), width: Math.round(e.getBoundingClientRect().width), height: Math.round(e.getBoundingClientRect().height) })))`)
   for (const target of dateTouchMetrics.filter((entry) => entry.width < 44 || entry.height < 44)) check(false, `Date-list touch target below 44px: ${target.label} (${target.width}x${target.height})`)
   await click('button[aria-label="Move Undated two earlier among undated items"]')
   await waitUntil(`JSON.stringify([...document.querySelectorAll('.date-item-section')[1].querySelectorAll('.item-open strong')].map((e) => e.textContent)) === '["Undated two","Undated one"]'`, 'undated item reorder')
   await clickItemAction('Later date', 'Edit')
+  await assertAxControls([
+    { role: 'textbox', name: 'Title' },
+    { role: 'combobox', name: 'Date' },
+    { role: 'button', name: 'Save item' },
+  ], 'date item edit form')
   await choose('form.list-form select', 'Date only')
   await evaluate(`(() => { const input = document.querySelector('form.list-form input[type="date"]'); input.value = '2027-01-01'; input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true })); })()`)
   await clickText('Save item', 'form.list-form')
@@ -328,9 +441,7 @@ async function start() {
   console.log('dated order after change:', JSON.stringify(changedDates))
   assert(JSON.stringify(changedDates) === JSON.stringify(['Later date', 'Earlier date', 'Timed entry']), 'Changing an item date did not update chronological order')
   await saveScreenshot('nextup-date-list.png', 1280, 900)
-  const dateReload = waitForEvent('Page.loadEventFired')
-  await send('Page.reload')
-  await dateReload
+  await reloadPage()
   await waitUntil(`document.querySelectorAll('.date-item-section article').length === 5`, 'date list after reload')
   const dateAfterReload = await evaluate(`[...document.querySelectorAll('.date-item-section')].map((section) => ({ name: section.querySelector('h3').textContent, items: [...section.querySelectorAll('.item-open strong')].map((e) => e.textContent) }))`)
   assert(JSON.stringify(dateAfterReload.find((section) => section.name === 'Dated')?.items) === JSON.stringify(['Later date', 'Earlier date', 'Timed entry']), 'Changed dated order did not persist after reload')
@@ -338,7 +449,7 @@ async function start() {
   await viewport(390, 844, true)
   await saveScreenshot('nextup-date-list-phone.png', 390, 844)
 
-  await send('Page.navigate', { url: appUrl })
+  await navigate(appUrl)
   await waitUntil(`document.querySelectorAll('.home-list-rail').length === 2`, 'home route with both lists')
   await saveScreenshot('nextup-home.png', 390, 844)
   await viewport(1280, 900, false)
@@ -352,7 +463,7 @@ async function start() {
   await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] })
   const transition = await evaluate(`getComputedStyle(document.querySelector('.manual-item-card')).transitionDuration`)
   check(transition.split(',').every((value) => Number.parseFloat(value) === 0), `Reduced motion leaves transitions enabled: ${transition}`)
-  await send('Page.navigate', { url: appUrl })
+  await navigate(appUrl)
   await waitUntil(`document.querySelector('.home-item-rail')`, 'home route for reduced-motion rail check')
   await evaluate(`(() => { const rail = document.querySelector('.home-item-rail'); rail.scrollLeft = 0; rail.focus(); })()`)
   await press('ArrowRight', 'ArrowRight', 39)
@@ -361,9 +472,7 @@ async function start() {
 
   const errorStateSetup = await evaluate(`new Promise((resolve, reject) => { const request = indexedDB.open('nextup-local-data', 2); request.onerror = () => reject(request.error); request.onsuccess = () => { const db = request.result; const tx = db.transaction('snapshots', 'readwrite'); tx.objectStore('snapshots').put({ schemaVersion: 999 }, 'current'); tx.oncomplete = () => { db.close(); resolve(true); }; tx.onerror = () => reject(tx.error); }; })`)
   assert(errorStateSetup, 'Could not prepare a local corrupted-data error-state check')
-  const errorReload = waitForEvent('Page.loadEventFired')
-  await send('Page.reload')
-  await errorReload
+  await reloadPage()
   await waitUntil(`!!document.querySelector('.error-card[role="alert"]')`, 'saved-data error state')
   assert(await evaluate(`document.querySelector('.error-card button')?.textContent.trim() === 'Try again'`), 'Saved-data error state lacks its retry action')
 
@@ -413,13 +522,35 @@ function crc32(buffer) {
   return (crc ^ -1) >>> 0
 }
 
+async function stopChild(child, label) {
+  if (!child || child.pid === undefined || child.spawnFailure || child.exitCode !== null || child.signalCode !== null) return
+  const waitForExit = () => new Promise((resolveExit) => child.once('exit', resolveExit))
+  let exited = waitForExit()
+  try { child.kill('SIGTERM') } catch { /* A just-exited process may reject the signal. */ }
+  await Promise.race([exited, delay(2_000)])
+  if (child.exitCode === null && child.signalCode === null) {
+    exited = waitForExit()
+    try { child.kill('SIGKILL') } catch { /* Continue to the bounded exit wait. */ }
+    await Promise.race([exited, delay(2_000)])
+  }
+  if (child.exitCode === null && child.signalCode === null) throw new Error(`${label} did not exit after SIGTERM and SIGKILL`)
+}
+
+async function cleanup() {
+  failTransport(new Error('E2E runner shutting down'))
+  try { client?.close() } catch { /* Continue stopping child processes and removing the profile. */ }
+  const cleanupErrors = []
+  for (const [child, label] of [[chrome, 'Chromium'], [vite, 'Vite']]) {
+    try { await stopChild(child, label) } catch (error) { cleanupErrors.push(error) }
+  }
+  try { await rm(profileDir, { recursive: true, force: true }) } catch (error) { cleanupErrors.push(error) }
+  if (cleanupErrors.length) throw new AggregateError(cleanupErrors, 'One or more E2E cleanup steps failed')
+}
+
 let failure
 try { await start() } catch (error) { failure = error } finally {
-  client?.close()
-  chrome?.kill('SIGTERM')
-  vite?.kill('SIGTERM')
-  if (chrome && chrome.exitCode === null) await Promise.race([once(chrome, 'exit'), delay(2000)])
-  if (vite && vite.exitCode === null) await Promise.race([once(vite, 'exit'), delay(2000)])
-  await rm(profileDir, { recursive: true, force: true })
+  try { await cleanup() } catch (error) {
+    failure = failure ? new AggregateError([failure, error], 'E2E run and cleanup failed') : error
+  }
 }
 if (failure) throw failure

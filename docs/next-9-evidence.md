@@ -13,13 +13,15 @@ Captured locally with Chromium 154.0.8037.97. The screenshots use seeded browser
 
 The browser runner is dependency-free and uses Node's built-in WebSocket/CDP support. Run `pnpm run test:e2e` with local dependencies installed and system Chromium available. It starts a local Vite server and a temporary isolated Chromium profile; it does not use a remote browser or publish the app.
 
+CDP commands have a 10-second deadline, CDP event waits have a 15-second deadline, and UI state polling is capped at 12 seconds. A CDP WebSocket close or error rejects all pending command and event promises. The runner's `finally` cleanup closes the socket, allows up to two seconds after SIGTERM and another two after SIGKILL for each child, and removes the temporary browser profile even if another cleanup step fails. Any failed cleanup step is reported after the remaining cleanup steps are attempted.
+
 ## Acceptance matrix
 
 | Acceptance area | Evidence and result |
 | --- | --- |
 | Manual list lifecycle | Passed: created a manual list with an image-backed item and two other items; renamed and reordered stages; reordered items within a stage; reloaded and verified stage/item order, statuses, image Blob persistence, rendered image dimensions, and alt text. |
 | Date list lifecycle | Passed: created dated, local date-time, and undated entries; changed a date; reloaded and verified chronological dated order and the explicit **Undated** section. Only undated entries expose reorder controls, and their order persisted. |
-| Keyboard and semantics | Passed: keyboard tab/focus order, visible focus treatment, accessible control names, and keyboard Enter reorder alternative were exercised. Reorder actions have labeled buttons. |
+| Keyboard and semantics | Passed: keyboard tab/focus order, visible focus treatment, and keyboard Enter reorder alternative were exercised. Chromium CDP `Accessibility.getFullAXTree` verified computed role/name pairs on the manual flow: button `＋ New item`, textbox `Rename stage Doing`, button `Move North Star later in Soon`, and link `Moonrise`; on the date flow: button `＋ New item`, button `Move Undated two earlier among undated items`, link `Undated one No date`; and on the date edit form: textbox `Title`, combobox `Date`, and button `Save item`. This is a targeted AX-tree check of those controls, not coverage of every control. No screen-reader session was run. |
 | Touch targets | Passed: measured relevant stage controls, item reorder controls, and date controls at 44×44 CSS pixels minimum. |
 | Reduced motion | Passed: reduced-motion card transitions measured `0s`; the home rail keyboard action moved immediately (`scrollLeft` 0 → 194) rather than animating. |
 | Responsive layout and routes | Passed: reviewed 390px phone and 1280px desktop screenshots; the home rail overflows horizontally (584px content in a 390px viewport) and accepts a touch swipe. The manual route uses a single stage flow without Kanban columns. Item detail and back-to-list navigation were exercised. |
