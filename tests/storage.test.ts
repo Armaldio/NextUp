@@ -5,8 +5,8 @@ import { IndexedDbDriver, LocalDataRepository, StorageError, type LocalDataDrive
 import { InvalidDataError, validateAppData } from '../src/domain/validation.ts'
 
 const sampleData: AppData = {
-  schemaVersion: 1,
-  lists: [{ id: 'list-1', title: 'Reading', mode: 'status', sortOrder: 0 }],
+  schemaVersion: 3,
+  lists: [{ id: 'list-1', title: 'Reading', mode: 'status', sortOrder: 0, icon: null }],
   statuses: [
     { id: 'status-1', listId: 'list-1', title: 'To read', order: 0 },
     { id: 'status-2', listId: 'list-1', title: 'Done', order: 1 },
@@ -16,7 +16,7 @@ const sampleData: AppData = {
     listId: 'list-1',
     title: 'The Left Hand of Darkness',
     notes: 'Keep this note',
-    imageId: 'image-1',
+    imageId: 'image-1', externalUrl: null,
     date: { kind: 'date-only', value: '2026-10-13' },
     statusId: 'status-1',
     position: 4,
@@ -34,11 +34,18 @@ class MemoryDriver implements LocalDataDriver {
     return this.snapshot
   }
 
-  async writeData(snapshot: AppData, images: ReadonlyMap<string, Blob>): Promise<void> {
+  async writeData(snapshot: AppData, images: ReadonlyMap<string, Blob>, deleteImageIds: ReadonlySet<string> = new Set()): Promise<void> {
     this.checkAvailable()
     this.writeCount += 1
     this.snapshot = structuredClone(snapshot)
     this.images = new Map([...this.images, ...images])
+    for (const id of deleteImageIds) if (!images.has(id)) this.images.delete(id)
+  }
+
+  async deleteList(snapshot: AppData, imageIdsToDelete: ReadonlySet<string>): Promise<void> {
+    this.writeCount += 1
+    this.snapshot = structuredClone(snapshot)
+    for (const id of imageIdsToDelete) this.images.delete(id)
   }
 
   async readImage(id: string): Promise<Blob | undefined> {
@@ -55,7 +62,7 @@ test('loads an empty, versioned model when no data has been saved', async () => 
   const repository = new LocalDataRepository(new MemoryDriver())
 
   assert.deepEqual(await repository.load(), {
-    schemaVersion: 1,
+    schemaVersion: 3,
     lists: [],
     statuses: [],
     items: [],
@@ -76,7 +83,7 @@ test('persists ordered statuses, item positions, date values, and durable image 
 
 test('rejects malformed snapshots and broken list, status, and image references', async (t) => {
   const invalidCases: { snapshot: unknown; expectedMessage: RegExp }[] = [
-    { snapshot: { schemaVersion: 1, lists: 'not an array', statuses: [], items: [] }, expectedMessage: /must be arrays/i },
+    { snapshot: { schemaVersion: 3, lists: 'not an array', statuses: [], items: [] }, expectedMessage: /must be arrays/i },
     { snapshot: { ...sampleData, items: [{ ...sampleData.items[0], listId: 'missing-list' }] }, expectedMessage: /missing list/i },
     { snapshot: { ...sampleData, items: [{ ...sampleData.items[0], statusId: 'missing-status' }] }, expectedMessage: /invalid status/i },
     { snapshot: { ...sampleData, items: [{ ...sampleData.items[0], imageId: 'missing-image' }] }, expectedMessage: /image missing-image is missing/i },
@@ -107,16 +114,21 @@ test('rejects malformed snapshots and broken list, status, and image references'
 
 test('date lists keep statuses absent and accept items without a status', async () => {
   const dateList: AppData = {
-    schemaVersion: 1,
-    lists: [{ id: 'calendar', title: 'Calendar', mode: 'date', sortOrder: 0 }],
+    schemaVersion: 3,
+    lists: [{ id: 'calendar', title: 'Calendar', mode: 'date', sortOrder: 0, icon: null }],
     statuses: [],
-    items: [{ id: 'event', listId: 'calendar', title: 'Appointment', notes: '', imageId: null, date: { kind: 'local-date-time', value: '2026-10-13T09:30' }, statusId: null, position: 0 }],
+    items: [{ id: 'event', listId: 'calendar', title: 'Appointment', notes: '', imageId: null, externalUrl: null, date: { kind: 'local-date-time', value: '2026-10-13T09:30' }, statusId: null, position: 0 }],
   }
   const driver = new MemoryDriver()
 
   await new LocalDataRepository(driver).save(dateList)
 
   assert.deepEqual(await new LocalDataRepository(driver).load(), dateList)
+})
+
+test('accepts external HTTP links and rejects unsafe protocols', () => {
+  assert.doesNotThrow(() => validateAppData({ ...sampleData, items: [{ ...sampleData.items[0], externalUrl: 'https://example.com/path' }] }))
+  assert.throws(() => validateAppData({ ...sampleData, items: [{ ...sampleData.items[0], externalUrl: 'javascript:alert(1)' }] }), /HTTP or HTTPS/i)
 })
 
 test('rejects object URLs as persisted image references', () => {
@@ -137,7 +149,7 @@ test('rejects an unsupported schema version without clearing stored data', async
 
 test('migrates a complete v0 snapshot without changing model fields or image data', async () => {
   const driver = new MemoryDriver()
-  const original = { ...sampleData, schemaVersion: 0 }
+  const original = { ...sampleData, schemaVersion: 0, lists: sampleData.lists.map(({ icon: _icon, ...list }) => list), items: sampleData.items.map(({ externalUrl: _url, ...item }) => item) }
   const image = new Blob(['old image'], { type: 'image/png' })
   driver.snapshot = structuredClone(original)
   driver.images.set('image-1', image)
@@ -149,10 +161,10 @@ test('migrates a complete v0 snapshot without changing model fields or image dat
 })
 
 test('rejects ambiguous or invalid v0 data without persisting a migration', async (t) => {
-  const ambiguous = structuredClone({ ...sampleData, schemaVersion: 0 }) as Record<string, unknown>
+  const ambiguous = structuredClone({ ...sampleData, schemaVersion: 0, lists: sampleData.lists.map(({ icon: _icon, ...list }) => list), items: sampleData.items.map(({ externalUrl: _url, ...item }) => item) }) as Record<string, unknown>
   ambiguous.lists = [{ id: 'list-1', title: 'Missing historical mode' }]
-  const missingImage = structuredClone({ ...sampleData, schemaVersion: 0 })
-  const unknownShape = { ...sampleData, schemaVersion: 0, legacyPayload: { content: 'unrecognized' } }
+  const missingImage = structuredClone({ ...sampleData, schemaVersion: 0, lists: sampleData.lists.map(({ icon: _icon, ...list }) => list), items: sampleData.items.map(({ externalUrl: _url, ...item }) => item) })
+  const unknownShape = { ...missingImage, legacyPayload: { content: 'unrecognized' } }
   const cases = [
     { value: ambiguous, expectedMessage: /ambiguous or unsupported shape/i },
     { value: missingImage, expectedMessage: /image image-1 is missing/i },
@@ -185,4 +197,74 @@ test('reports storage unavailability as a recoverable error', async () => {
 
 test('reports a browser without IndexedDB as a recoverable storage error', async () => {
   await assert.rejects(() => new LocalDataRepository(new IndexedDbDriver()).load(), StorageError)
+})
+
+test('creates, updates, and deletes items without moving them when their date changes', async () => {
+  const driver = new MemoryDriver()
+  const repository = new LocalDataRepository(driver)
+  await repository.save(sampleData, new Map([['image-1', new Blob(['image'])]]))
+  const created = { ...sampleData.items[0], id: 'item-2', title: 'Second item', imageId: null, externalUrl: 'https://example.com', date: { kind: 'local-date-time' as const, value: '2026-10-14T12:30' }, position: 5 }
+  await repository.saveItem(created)
+  const edited = { ...created, date: { kind: 'date-only' as const, value: '2026-10-15' } }
+  await repository.saveItem(edited)
+  const reloaded = await repository.load()
+  assert.equal(reloaded.items.find((item) => item.id === created.id)?.position, 5)
+  assert.deepEqual(reloaded.items.find((item) => item.id === created.id)?.date, edited.date)
+  assert.equal(reloaded.items.find((item) => item.id === created.id)?.externalUrl, 'https://example.com')
+  await repository.deleteItem('item-1')
+  assert.equal(driver.images.has('image-1'), false)
+})
+
+test('rejects an item image reference without a new or persisted Blob before writing', async () => {
+  const driver = new MemoryDriver()
+  driver.snapshot = structuredClone(sampleData)
+  driver.images.set('image-1', new Blob(['existing image']))
+  const before = structuredClone(driver.snapshot)
+  const repository = new LocalDataRepository(driver)
+  const item = { ...sampleData.items[0], id: 'item-with-missing-image', imageId: 'missing-image' }
+
+  await assert.rejects(() => repository.saveItem(item), /image missing-image is missing/i)
+  assert.deepEqual(driver.snapshot, before)
+  assert.equal(driver.writeCount, 0)
+})
+
+test('migrates v1 lists losslessly and adds empty icon fields', async () => {
+  const driver = new MemoryDriver()
+  const old = structuredClone(sampleData) as Record<string, any>
+  old.schemaVersion = 1
+  delete old.items[0].externalUrl
+  delete old.lists[0].icon
+  driver.snapshot = old
+  driver.images.set('image-1', new Blob(['kept image'], { type: 'image/png' }))
+  const loaded = await new LocalDataRepository(driver).load()
+  assert.equal(loaded.schemaVersion, 3)
+  assert.deepEqual(loaded.lists[0], { ...sampleData.lists[0], icon: null })
+  assert.deepEqual(loaded.statuses, sampleData.statuses)
+  assert.deepEqual(loaded.items, sampleData.items)
+  assert.equal(await driver.images.get('image-1')?.text(), 'kept image')
+})
+
+test('migrates v2 items with no external link without losing existing fields', async () => {
+  const driver = new MemoryDriver()
+  const old = structuredClone(sampleData) as Record<string, any>
+  old.schemaVersion = 2
+  delete old.items[0].externalUrl
+  driver.snapshot = old
+  driver.images.set('image-1', new Blob(['preserved']))
+  const loaded = await new LocalDataRepository(driver).load()
+  assert.equal(loaded.schemaVersion, 3)
+  assert.equal(loaded.items[0].externalUrl, null)
+  assert.equal(loaded.items[0].date?.kind, 'date-only')
+  assert.equal(await driver.images.get('image-1')?.text(), 'preserved')
+})
+
+test('deletes list data and only image blobs that are no longer referenced', async () => {
+  const driver = new MemoryDriver()
+  const repository = new LocalDataRepository(driver)
+  const shared = { id: 'shared-list', title: 'Shared', mode: 'date' as const, sortOrder: 1, icon: null }
+  driver.snapshot = { ...sampleData, lists: [...sampleData.lists, shared], items: [...sampleData.items, { ...sampleData.items[0], id: 'other-item', listId: shared.id, statusId: null, position: 17 }] }
+  driver.images.set('image-1', new Blob(['shared image']))
+  await repository.deleteList('list-1')
+  assert.deepEqual(driver.snapshot, { schemaVersion: 3, lists: [{ ...shared, sortOrder: 0 }], statuses: [], items: [{ ...sampleData.items[0], id: 'other-item', listId: shared.id, statusId: null, position: 17 }] })
+  assert.equal(await driver.images.get('image-1')?.text(), 'shared image')
 })

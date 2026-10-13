@@ -3,8 +3,8 @@ import { test } from 'node:test'
 import { validateAppData } from '../src/domain/validation.ts'
 
 const emptyModel = {
-  schemaVersion: 1,
-  lists: [{ id: 'dates', title: 'Dates', mode: 'date', sortOrder: 0 }],
+  schemaVersion: 3,
+  lists: [{ id: 'dates', title: 'Dates', mode: 'date', sortOrder: 0, icon: null }],
   statuses: [],
   items: [],
 }
@@ -12,7 +12,7 @@ const emptyModel = {
 function validateDate(value: string): void {
   validateAppData({
     ...emptyModel,
-    items: [{ id: 'date-item', listId: 'dates', title: 'Date', notes: '', imageId: null, date: { kind: 'date-only', value }, statusId: null, position: 0 }],
+    items: [{ id: 'date-item', listId: 'dates', title: 'Date', notes: '', imageId: null, externalUrl: null, date: { kind: 'date-only', value }, statusId: null, position: 0 }],
   })
 }
 

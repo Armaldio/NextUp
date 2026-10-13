@@ -1,4 +1,4 @@
-import { emptyAppData, type AppData } from './model.ts'
+import { CURRENT_SCHEMA_VERSION, emptyAppData, type AppData, type Item } from './model.ts'
 import { InvalidDataError, validateAppData } from './validation.ts'
 
 export class StorageError extends Error {
@@ -10,8 +10,9 @@ export class StorageError extends Error {
 
 export interface LocalDataDriver {
   readSnapshot(): Promise<unknown | undefined>
-  writeData(snapshot: AppData, images: ReadonlyMap<string, Blob>): Promise<void>
+  writeData(snapshot: AppData, images: ReadonlyMap<string, Blob>, deleteImageIds?: ReadonlySet<string>): Promise<void>
   readImage(id: string): Promise<Blob | undefined>
+  deleteList?(snapshot: AppData, imageIdsToDelete: ReadonlySet<string>): Promise<void>
 }
 
 export class LocalDataRepository {
@@ -29,7 +30,7 @@ export class LocalDataRepository {
       for (const id of imageIds(data)) {
         if (!(await this.driver.readImage(id))) throw new InvalidDataError(`Item image ${id} is missing`)
       }
-      if (isRecord(raw) && raw.schemaVersion === 0) await this.driver.writeData(data, new Map())
+      if (isRecord(raw) && typeof raw.schemaVersion === 'number' && raw.schemaVersion < CURRENT_SCHEMA_VERSION) await this.driver.writeData(data, new Map())
       return data
     } catch (error) {
       if (error instanceof StorageError) throw error
@@ -55,6 +56,68 @@ export class LocalDataRepository {
     }
   }
 
+
+  async saveItem(item: Item, image?: Blob): Promise<void> {
+    try {
+      const current = validateAppData(migrateSnapshot(await this.driver.readSnapshot() ?? emptyAppData()))
+      const list = current.lists.find((entry) => entry.id === item.listId)
+      if (!list) throw new InvalidDataError(`Item ${item.id} refers to a missing list`)
+      const previous = current.items.find((entry) => entry.id === item.id)
+      const prepared: Item = {
+        ...item,
+        position: previous?.position ?? Math.max(-1, ...current.items.filter((entry) => entry.listId === item.listId).map((entry) => entry.position)) + 1,
+      }
+      const next = validateAppData({ ...current, items: previous
+        ? current.items.map((entry) => entry.id === item.id ? prepared : entry)
+        : [...current.items, prepared] })
+      if (image !== undefined && !(image instanceof Blob)) throw new InvalidDataError('Image references must contain Blob data')
+      if (prepared.imageId && !image && !(await this.driver.readImage(prepared.imageId))) {
+        throw new InvalidDataError(`Item image ${prepared.imageId} is missing`)
+      }
+      const images = new Map<string, Blob>()
+      if (image && prepared.imageId) images.set(prepared.imageId, image)
+      const deletedImages = new Set(current.items.flatMap((entry) => entry.imageId && !next.items.some((nextEntry) => nextEntry.imageId === entry.imageId) ? [entry.imageId] : []))
+      await this.driver.writeData(next, images, deletedImages)
+    } catch (error) {
+      if (error instanceof StorageError) throw error
+      throw new StorageError(`Could not save item: ${errorMessage(error)}`, { cause: error })
+    }
+  }
+
+  async deleteItem(itemId: string): Promise<void> {
+    try {
+      const current = validateAppData(migrateSnapshot(await this.driver.readSnapshot() ?? emptyAppData()))
+      const removed = current.items.find((item) => item.id === itemId)
+      if (!removed) return
+      const next = validateAppData({ ...current, items: current.items.filter((item) => item.id !== itemId) })
+      const deletedImages = new Set(removed.imageId && !next.items.some((item) => item.imageId === removed.imageId) ? [removed.imageId] : [])
+      await this.driver.writeData(next, new Map(), deletedImages)
+    } catch (error) {
+      if (error instanceof StorageError) throw error
+      throw new StorageError(`Could not delete item: ${errorMessage(error)}`, { cause: error })
+    }
+  }
+
+  async deleteList(listId: string): Promise<void> {
+    try {
+      const current = validateAppData(migrateSnapshot(await this.driver.readSnapshot() ?? emptyAppData()))
+      const removedImages = new Set(current.items.filter((item) => item.listId === listId && item.imageId).map((item) => item.imageId as string))
+      const next: AppData = {
+        ...current,
+        lists: current.lists.filter((list) => list.id !== listId).map((list, index) => ({ ...list, sortOrder: index })),
+        statuses: current.statuses.filter((status) => status.listId !== listId),
+        items: current.items.filter((item) => item.listId !== listId),
+      }
+      const retainedImages = imageIds(next)
+      for (const id of retainedImages) removedImages.delete(id)
+      if (this.driver.deleteList) await this.driver.deleteList(validateAppData(next), removedImages)
+      else await this.driver.writeData(validateAppData(next), new Map())
+    } catch (error) {
+      if (error instanceof StorageError) throw error
+      throw new StorageError(`Could not delete list: ${errorMessage(error)}`, { cause: error })
+    }
+  }
+
   async getImage(id: string): Promise<Blob | undefined> {
     try {
       return await this.driver.readImage(id)
@@ -75,6 +138,22 @@ function errorMessage(error: unknown): string {
 function migrateSnapshot(value: unknown): unknown {
   if (!isRecord(value) || !('schemaVersion' in value)) return value
   const record = value
+  if (record.schemaVersion === 1) {
+    assertKeys(record, ['schemaVersion', 'lists', 'statuses', 'items'], [], 'Version 1 snapshot')
+    if (!Array.isArray(record.lists) || !Array.isArray(record.statuses) || !Array.isArray(record.items)) throw new InvalidDataError('Version 1 snapshot is malformed')
+    for (const list of record.lists) assertKeys(list, ['id', 'title', 'mode', 'sortOrder'], [], 'Version 1 list')
+    for (const status of record.statuses) assertKeys(status, ['id', 'listId', 'title', 'order'], [], 'Version 1 status')
+    for (const item of record.items) assertKeys(item, ['id', 'listId', 'title', 'notes', 'imageId', 'statusId', 'position'], ['date'], 'Version 1 item')
+    return { ...record, schemaVersion: 3, lists: record.lists.map((list) => ({ ...list as object, icon: null })), items: record.items.map((item) => ({ ...item as object, externalUrl: null })) }
+  }
+  if (record.schemaVersion === 2) {
+    assertKeys(record, ['schemaVersion', 'lists', 'statuses', 'items'], [], 'Version 2 snapshot')
+    if (!Array.isArray(record.lists) || !Array.isArray(record.statuses) || !Array.isArray(record.items)) throw new InvalidDataError('Version 2 snapshot is malformed')
+    for (const list of record.lists) assertKeys(list, ['id', 'title', 'mode', 'sortOrder', 'icon'], [], 'Version 2 list')
+    for (const status of record.statuses) assertKeys(status, ['id', 'listId', 'title', 'order'], [], 'Version 2 status')
+    for (const item of record.items) assertKeys(item, ['id', 'listId', 'title', 'notes', 'imageId', 'statusId', 'position'], ['date'], 'Version 2 item')
+    return { ...record, schemaVersion: 3, items: record.items.map((item) => ({ ...item as object, externalUrl: null })) }
+  }
   if (record.schemaVersion !== 0) return value
   // The repository history predating this model has no stored domain shape to infer from.
   // Only migrate a complete snapshot with the current fields, changing its version marker.
@@ -87,7 +166,7 @@ function migrateSnapshot(value: unknown): unknown {
   for (const item of record.items) {
     assertKeys(item, ['id', 'listId', 'title', 'notes', 'imageId', 'statusId', 'position'], ['date'], 'Version 0 item')
   }
-  return { ...record, schemaVersion: 1 }
+  return { ...record, schemaVersion: 3, lists: record.lists.map((list) => ({ ...list as object, icon: null })), items: record.items.map((item) => ({ ...item as object, externalUrl: null })) }
 }
 
 function assertKeys(value: unknown, required: string[], optional: string[], label: string): void {
@@ -103,7 +182,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 const DATABASE_NAME = 'nextup-local-data'
-const DATABASE_VERSION = 1
+const DATABASE_VERSION = 2
 const SNAPSHOT_STORE = 'snapshots'
 const IMAGE_STORE = 'images'
 const SNAPSHOT_KEY = 'current'
@@ -127,7 +206,7 @@ export class IndexedDbDriver implements LocalDataDriver {
     }
   }
 
-  async writeData(snapshot: AppData, images: ReadonlyMap<string, Blob>): Promise<void> {
+  async writeData(snapshot: AppData, images: ReadonlyMap<string, Blob>, deleteImageIds: ReadonlySet<string> = new Set()): Promise<void> {
     const database = await this.open()
     try {
       const transaction = database.transaction([SNAPSHOT_STORE, IMAGE_STORE], 'readwrite')
@@ -136,6 +215,7 @@ export class IndexedDbDriver implements LocalDataDriver {
         transaction.objectStore(SNAPSHOT_STORE).put(snapshot, SNAPSHOT_KEY)
         const imageStore = transaction.objectStore(IMAGE_STORE)
         for (const [id, image] of images) imageStore.put(image, id)
+        for (const id of deleteImageIds) if (!images.has(id)) imageStore.delete(id)
         await completed
       } catch (error) {
         try {
@@ -149,6 +229,18 @@ export class IndexedDbDriver implements LocalDataDriver {
     } finally {
       database.close()
     }
+  }
+
+  async deleteList(snapshot: AppData, imageIdsToDelete: ReadonlySet<string>): Promise<void> {
+    const database = await this.open()
+    try {
+      const transaction = database.transaction([SNAPSHOT_STORE, IMAGE_STORE], 'readwrite')
+      const completed = transactionDone(transaction)
+      transaction.objectStore(SNAPSHOT_STORE).put(snapshot, SNAPSHOT_KEY)
+      const images = transaction.objectStore(IMAGE_STORE)
+      for (const id of imageIdsToDelete) images.delete(id)
+      await completed
+    } finally { database.close() }
   }
 
   async readImage(id: string): Promise<Blob | undefined> {

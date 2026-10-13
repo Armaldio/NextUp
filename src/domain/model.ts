@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 1 as const
+export const CURRENT_SCHEMA_VERSION = 3 as const
 
 export type ListMode = 'status' | 'date'
 
@@ -7,6 +7,7 @@ export interface List {
   title: string
   mode: ListMode
   sortOrder: number
+  icon: string | null
 }
 
 export interface Status {
@@ -26,6 +27,7 @@ export interface Item {
   title: string
   notes: string
   imageId: string | null
+  externalUrl: string | null
   date?: ItemDate
   statusId: string | null
   position: number

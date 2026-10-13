@@ -55,6 +55,7 @@ function parseList(value: unknown): List {
     title: text(value.title, 'List title'),
     mode: value.mode,
     sortOrder: order(value.sortOrder, 'List sortOrder'),
+    icon: value.icon === undefined || value.icon === null ? null : text(value.icon, 'List icon'),
   }
 }
 
@@ -66,6 +67,14 @@ function parseStatus(value: unknown): Status {
     title: text(value.title, 'Status title'),
     order: order(value.order, 'Status order'),
   }
+}
+
+function validExternalUrl(value: unknown): string {
+  const urlText = text(value, 'Item externalUrl')
+  let url: URL
+  try { url = new URL(urlText) } catch { throw new InvalidDataError('Item externalUrl must be a valid HTTP or HTTPS URL') }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new InvalidDataError('Item externalUrl must use HTTP or HTTPS')
+  return urlText
 }
 
 function parseItem(value: unknown): Item {
@@ -80,6 +89,7 @@ function parseItem(value: unknown): Item {
     title: text(value.title, 'Item title'),
     notes: text(value.notes, 'Item notes', true),
     imageId,
+    externalUrl: value.externalUrl === undefined || value.externalUrl === null ? null : validExternalUrl(value.externalUrl),
     statusId: value.statusId === null ? null : text(value.statusId, 'Item statusId'),
     position: order(value.position, 'Item position'),
   }

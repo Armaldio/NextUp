@@ -2,13 +2,13 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { IDBFactory } from 'fake-indexeddb'
 import type { AppData } from '../src/domain/model.ts'
-import { IndexedDbDriver } from '../src/domain/storage.ts'
+import { IndexedDbDriver, LocalDataRepository } from '../src/domain/storage.ts'
 
 const originalData: AppData = {
-  schemaVersion: 1,
-  lists: [{ id: 'list-1', title: 'Read', mode: 'status', sortOrder: 0 }],
+  schemaVersion: 3,
+  lists: [{ id: 'list-1', title: 'Read', mode: 'status', sortOrder: 0, icon: null }],
   statuses: [{ id: 'status-1', listId: 'list-1', title: 'Next', order: 0 }],
-  items: [{ id: 'item-1', listId: 'list-1', title: 'Book', notes: '', imageId: 'image-1', statusId: 'status-1', position: 2 }],
+  items: [{ id: 'item-1', listId: 'list-1', title: 'Book', notes: '', imageId: 'image-1', externalUrl: null, statusId: 'status-1', position: 2 }],
 }
 
 test('opens, writes, closes, and reopens a persisted snapshot and Blob image', async () => {
@@ -52,4 +52,18 @@ test('aborts a failed readwrite transaction without changing the previous snapsh
   const reopenedDriver = new IndexedDbDriver(factory)
   assert.deepEqual(await reopenedDriver.readSnapshot(), originalData)
   assert.equal(await (await reopenedDriver.readImage('image-1'))?.text(), 'prior image')
+})
+
+
+test('deletes a list atomically and keeps images referenced by another list', async () => {
+  const factory = new IDBFactory()
+  const driver = new IndexedDbDriver(factory)
+  const repository = new LocalDataRepository(driver)
+  const image = new Blob(['shared image'], { type: 'image/png' })
+  const otherList = { id: 'other', title: 'Other', mode: 'date' as const, sortOrder: 1, icon: null }
+  const otherItem = { id: 'other-item', listId: 'other', title: 'Still here', notes: '', imageId: 'image-1', externalUrl: null, statusId: null, position: 0 }
+  await repository.save({ ...originalData, lists: [...originalData.lists, otherList], items: [...originalData.items, otherItem] }, new Map([['image-1', image]]))
+  await repository.deleteList('list-1')
+  assert.deepEqual(await driver.readSnapshot(), { schemaVersion: 3, lists: [{ ...otherList, sortOrder: 0 }], statuses: [], items: [{ ...otherItem, position: 0 }] })
+  assert.equal(await (await driver.readImage('image-1'))?.text(), 'shared image')
 })
