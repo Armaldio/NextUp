@@ -149,7 +149,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .stage-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
 .stage-list li, .stage-add { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; }
 .stage-list li label { grid-column: 1 / -1; color: #596660; font-size: .82rem; }
-.stage-list input, .stage-add input, .stage-remove-prompt select { min-height: 42px; min-width: 0; padding: 8px 10px; border: 1px solid #ccd7cf; border-radius: 9px; color: #172321; background: white; }
+.stage-list input, .stage-add input, .stage-remove-prompt select { min-height: 44px; min-width: 0; padding: 8px 10px; border: 1px solid #ccd7cf; border-radius: 9px; color: #172321; background: white; }
 .stage-list li input { grid-column: 1 / 2; }
 .stage-list li button:last-child { grid-column: 1 / -1; justify-self: start; }
 .stage-list button:disabled { opacity: .45; cursor: not-allowed; }
@@ -170,7 +170,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .list-open strong, .list-open small { display: block; }
 .list-open small { margin-top: 3px; color: #68746f; }
 .list-actions { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
-.text-button { min-height: 42px; padding: 6px 10px; border: 0; border-radius: 8px; color: #326b55; background: transparent; font-weight: 650; }
+.text-button { min-width: 44px; min-height: 44px; padding: 6px 10px; border: 0; border-radius: 8px; color: #326b55; background: transparent; font-weight: 650; }
 .danger-text { color: #9a392d; }
 .confirm-box { position: absolute; z-index: 2; inset: 8px; display: flex; flex-direction: column; justify-content: center; padding: 16px; border: 1px solid #ecc9c3; border-radius: 12px; background: #fffaf9; box-shadow: 0 8px 28px #17232120; }
 .confirm-box h2 { margin: 0 0 8px; font-size: 1.05rem; }
@@ -233,7 +233,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .manual-item-card { transition: border-color 120ms ease, transform 120ms ease, opacity 120ms ease; }
 .manual-item-heading { display: grid; grid-template-columns: 38px minmax(0, 1fr); align-items: start; gap: 8px; }
 .manual-item-heading .item-open { min-width: 0; padding-block: 6px; overflow-wrap: anywhere; }
-.drag-handle { display: grid; width: 38px; min-height: 42px; place-items: center; padding: 0; border: 1px solid #d9e2dc; border-radius: 9px; color: #507b69; background: #f6f8f6; font-size: 1.3rem; cursor: grab; touch-action: none; user-select: none; }
+.drag-handle { display: grid; width: 44px; min-height: 44px; place-items: center; padding: 0; border: 1px solid #d9e2dc; border-radius: 9px; color: #507b69; background: #f6f8f6; font-size: 1.3rem; cursor: grab; touch-action: none; user-select: none; }
 .drag-handle:active { cursor: grabbing; }
 .drag-handle:disabled { opacity: .45; cursor: not-allowed; }
 .manual-item-card.is-dragging { z-index: 1; opacity: .55; border-color: #579079; }
@@ -243,5 +243,14 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
   .list-settings { padding: 13px; }
   .manual-item-card { padding: 13px; }
   .manual-item-card .list-actions { gap: 4px; }
-  .manual-item-card .text-button { min-width: 40px; padding-inline: 8px; }
+  .manual-item-card .text-button { min-width: 44px; padding-inline: 8px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0s !important;
+  }
 }

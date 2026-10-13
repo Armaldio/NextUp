@@ -131,7 +131,8 @@ function scrollHomeRailWithKeyboard(event: KeyboardEvent): void {
   if (event.target !== event.currentTarget) return
   if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
   event.preventDefault()
-  ;(event.currentTarget as HTMLElement).scrollBy({ left: event.key === 'ArrowRight' ? 240 : -240, behavior: 'smooth' })
+  const behavior: ScrollBehavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'
+  ;(event.currentTarget as HTMLElement).scrollBy({ left: event.key === 'ArrowRight' ? 240 : -240, behavior })
 }
 function scrollHomeRailWithWheel(event: WheelEvent): void {
   if (event.deltaX !== 0 || event.deltaY === 0) return
