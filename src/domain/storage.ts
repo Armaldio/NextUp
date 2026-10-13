@@ -127,6 +127,21 @@ export class LocalDataRepository {
     await this.writeCurrent({ ...current, statuses, items }, 'remove stage')
   }
 
+  async reorderUndatedItems(listId: string, orderedItemIds: readonly string[]): Promise<void> {
+    const current = await this.readCurrent('reorder undated items')
+    const list = current.lists.find((entry) => entry.id === listId)
+    if (!list || list.mode !== 'date') throw new StorageError('Only date lists can reorder undated items')
+    const undated = current.items.filter((item) => item.listId === listId && !item.date).sort((a, b) => a.position - b.position)
+    const expectedIds = new Set(undated.map((item) => item.id))
+    if (orderedItemIds.length !== undated.length || new Set(orderedItemIds).size !== orderedItemIds.length || orderedItemIds.some((id) => !expectedIds.has(id))) {
+      throw new StorageError('Reorder must include every undated item in this date list')
+    }
+    const availablePositions = undated.map((item) => item.position).sort((a, b) => a - b)
+    const positionById = new Map(orderedItemIds.map((id, index) => [id, availablePositions[index]]))
+    const items = current.items.map((item) => positionById.has(item.id) ? { ...item, position: positionById.get(item.id)! } : item)
+    await this.writeCurrent({ ...current, items }, 'reorder undated items')
+  }
+
   private async readCurrent(action: string): Promise<AppData> {
     try { return validateAppData(migrateSnapshot(await this.driver.readSnapshot() ?? emptyAppData())) }
     catch (error) { throw new StorageError(`Could not ${action}: ${errorMessage(error)}`, { cause: error }) }

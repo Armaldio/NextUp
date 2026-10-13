@@ -185,6 +185,37 @@ test('date lists keep statuses absent and accept items without a status', async 
   assert.deepEqual(await new LocalDataRepository(driver).load(), dateList)
 })
 
+test('reorders only undated date-list items while preserving dated positions and images', async () => {
+  const driver = new MemoryDriver()
+  const repository = new LocalDataRepository(driver)
+  const dateList: AppData = {
+    schemaVersion: 3,
+    lists: [{ id: 'calendar', title: 'Calendar', mode: 'date', sortOrder: 0, icon: null }],
+    statuses: [],
+    items: [
+      { id: 'dated-late', listId: 'calendar', title: 'Later', notes: '', imageId: 'calendar-image', externalUrl: null, date: { kind: 'date-only', value: '2026-10-15' }, statusId: null, position: 0 },
+      { id: 'undated-first', listId: 'calendar', title: 'First', notes: '', imageId: null, externalUrl: null, statusId: null, position: 1 },
+      { id: 'dated-early', listId: 'calendar', title: 'Earlier', notes: '', imageId: null, externalUrl: null, date: { kind: 'date-only', value: '2026-10-14' }, statusId: null, position: 2 },
+      { id: 'undated-second', listId: 'calendar', title: 'Second', notes: '', imageId: null, externalUrl: null, statusId: null, position: 3 },
+    ],
+  }
+  await repository.save(dateList, new Map([['calendar-image', new Blob(['calendar cover'], { type: 'image/png' })]]))
+
+  await repository.reorderUndatedItems('calendar', ['undated-second', 'undated-first'])
+
+  const loaded = await repository.load()
+  assert.deepEqual(loaded.items.map(({ id, position }) => [id, position]), [
+    ['dated-late', 0],
+    ['undated-first', 3],
+    ['dated-early', 2],
+    ['undated-second', 1],
+  ])
+  assert.equal(await (await repository.getImage('calendar-image'))?.text(), 'calendar cover')
+  const beforeInvalidMove = await repository.load()
+  await assert.rejects(() => repository.reorderUndatedItems('calendar', ['dated-late', 'undated-first']), /every undated item/i)
+  assert.deepEqual(await repository.load(), beforeInvalidMove)
+})
+
 test('accepts external HTTP links and rejects unsafe protocols', () => {
   assert.doesNotThrow(() => validateAppData({ ...sampleData, items: [{ ...sampleData.items[0], externalUrl: 'https://example.com/path' }] }))
   assert.throws(() => validateAppData({ ...sampleData, items: [{ ...sampleData.items[0], externalUrl: 'javascript:alert(1)' }] }), /HTTP or HTTPS/i)

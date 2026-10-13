@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { IndexedDbDriver, LocalDataRepository, StorageError } from './domain/storage.ts'
 import type { AppData, Item, ItemDate, ListMode } from './domain/model.ts'
 import { createId } from './domain/id.ts'
+import { orderItemsForList } from './domain/order.ts'
 import { useAppRoute } from './router.ts'
 
 const repository = new LocalDataRepository(new IndexedDbDriver())
@@ -22,7 +23,8 @@ let focusAfterDelete = false
 const saving = ref(false)
 const lists = computed(() => [...(data.value?.lists ?? [])].sort((a, b) => a.sortOrder - b.sortOrder))
 const activeList = computed(() => { const currentRoute = route.value; return currentRoute.name === 'list-detail' || currentRoute.name === 'item-detail' ? data.value?.lists.find((list) => list.id === currentRoute.listId) : undefined })
-const activeItems = computed(() => data.value?.items.filter((item) => item.listId === activeList.value?.id).sort((a, b) => a.position - b.position) ?? [])
+const activeItems = computed(() => orderItemsForList(data.value?.items.filter((item) => item.listId === activeList.value?.id) ?? [], activeList.value?.mode ?? 'status'))
+const undatedItems = computed(() => activeList.value?.mode === 'date' ? activeItems.value.filter((item) => !item.date) : [])
 const currentItem = computed(() => { const currentRoute = route.value; return currentRoute.name === 'item-detail' ? data.value?.items.find((item) => item.id === currentRoute.itemId && item.listId === currentRoute.listId) : undefined })
 const itemTitle = ref('')
 const itemNotes = ref('')
@@ -45,6 +47,11 @@ const itemFormOpen = ref(false)
 const editingItemId = ref<string | null>(null)
 const maxImageBytes = 5 * 1024 * 1024
 const statusForItem = (item: Item) => data.value?.statuses.find((status) => status.id === item.statusId)?.title ?? ''
+function dateLabel(item: Item): string {
+  if (!item.date) return 'No date'
+  const value = item.date.kind === 'date-only' ? item.date.value : item.date.value.replace('T', ' ')
+  return `${value} · ${item.date.kind === 'date-only' ? 'Date only' : 'Local time'}`
+}
 function detailPath(item: Item): string { return `/lists/${encodeURIComponent(item.listId)}/items/${encodeURIComponent(item.id)}` }
 function clearItemForm(): void { itemFormOpen.value = false; editingItemId.value = null; itemTitle.value = ''; itemNotes.value = ''; itemLink.value = ''; itemStatusId.value = null; itemDateKind.value = 'none'; itemDateValue.value = ''; itemImageId.value = null; itemImage.value = null; itemError.value = '' }
 function editItem(item?: Item): void {
@@ -74,6 +81,21 @@ async function removeItem(item: Item): Promise<void> {
   if (!window.confirm(`Delete “${item.title}”? This also removes its image if no other item uses it.`)) return
   try { await repository.deleteItem(item.id); data.value = await repository.load(); if (route.value.name === 'item-detail') navigate(`/lists/${encodeURIComponent(item.listId)}`) }
   catch (error) { itemError.value = error instanceof Error ? error.message : 'Item could not be deleted.' }
+}
+async function moveUndatedItem(item: Item, offset: number): Promise<void> {
+  if (!activeList.value || activeList.value.mode !== 'date' || item.date) return
+  const index = undatedItems.value.findIndex((entry) => entry.id === item.id)
+  const targetIndex = index + offset
+  if (index < 0 || targetIndex < 0 || targetIndex >= undatedItems.value.length) return
+  const orderedIds = undatedItems.value.map((entry) => entry.id)
+  const movingId = orderedIds[index]!
+  orderedIds[index] = orderedIds[targetIndex]!
+  orderedIds[targetIndex] = movingId
+  itemError.value = ''
+  try {
+    await repository.reorderUndatedItems(activeList.value.id, orderedIds)
+    data.value = await repository.load()
+  } catch (error) { itemError.value = error instanceof Error ? error.message : 'Undated item order could not be saved.' }
 }
 async function loadDetailImage(): Promise<void> {
   if (itemImageUrl.value) URL.revokeObjectURL(itemImageUrl.value)
@@ -284,13 +306,13 @@ onMounted(loadSavedData)
               <p v-if="itemImageId && !itemImage" class="form-hint">An image is attached. Select a new image to replace it, or clear it below.</p><button v-if="itemImageId" type="button" class="text-button danger-text" @click="itemImageId = null; itemImage = null">Remove image</button>
               <p v-if="itemError" class="error-text" role="alert">{{ itemError }}</p><div class="form-actions"><button type="button" class="text-button" @click="clearItemForm">Cancel</button><button class="primary-button" :disabled="saving || !itemTitle.trim()">Save item</button></div>
             </form>
-            <div v-if="activeItems.length" class="list-grid"><article v-for="item in activeItems" :key="item.id" class="list-card"><a class="item-open" :href="detailPath(item)" @click="followRoute($event, detailPath(item))"><strong>{{ item.title }}</strong><small v-if="item.statusId">{{ statusForItem(item) }}</small><small v-if="item.date">{{ item.date.value }} <span>{{ item.date.kind === 'date-only' ? 'date only' : 'local time' }}</span></small></a><div class="list-actions"><button class="text-button" @click="editItem(item)">Edit</button><button class="text-button danger-text" @click="removeItem(item)">Delete</button></div></article></div>
+            <div v-if="activeItems.length" class="list-grid"><article v-for="item in activeItems" :key="item.id" class="list-card"><a class="item-open" :href="detailPath(item)" @click="followRoute($event, detailPath(item))"><strong>{{ item.title }}</strong><small v-if="item.statusId">{{ statusForItem(item) }}</small><small v-if="item.date || activeList.mode === 'date'">{{ dateLabel(item) }}</small></a><div class="list-actions"><template v-if="activeList.mode === 'date' && !item.date"><button class="text-button" :disabled="undatedItems[0]?.id === item.id" :aria-label="`Move ${item.title} earlier among undated items`" @click="moveUndatedItem(item, -1)">↑</button><button class="text-button" :disabled="undatedItems[undatedItems.length - 1]?.id === item.id" :aria-label="`Move ${item.title} later among undated items`" @click="moveUndatedItem(item, 1)">↓</button></template><button class="text-button" @click="editItem(item)">Edit</button><button class="text-button danger-text" @click="removeItem(item)">Delete</button></div></article></div>
             <p v-else-if="!editingItemId" class="quiet-count">No items yet. Add one to get started.</p>
           </template><p v-else class="message-card">This list could not be found.</p>
         </section>
         <section v-else-if="route.name === 'item-detail'" class="message-card">
           <a class="back-link" :href="`/lists/${encodeURIComponent(route.listId)}`" @click="followRoute($event, `/lists/${encodeURIComponent(route.listId)}`)">← Back to list</a>
-          <template v-if="currentItem"><p class="eyebrow">{{ activeList?.title ?? 'Item' }}</p><h1>{{ currentItem.title }}</h1><p v-if="currentItem.statusId" class="item-meta">{{ statusForItem(currentItem) }}</p><p v-if="currentItem.date" class="item-meta">{{ currentItem.date.value }} · {{ currentItem.date.kind === 'date-only' ? 'Date only' : 'Local date and time' }}</p><p v-if="currentItem.notes" class="item-notes">{{ currentItem.notes }}</p><p v-if="currentItem.externalUrl"><a :href="currentItem.externalUrl" target="_blank" rel="noopener noreferrer">Open external link</a></p><img v-if="currentItem.imageId && itemImageUrl" class="item-image" :src="itemImageUrl" :alt="`Image attached to ${currentItem.title}`"><p v-else-if="currentItem.imageId" class="form-hint" role="status">Image preview is unavailable, but the attachment remains saved.</p><div class="form-actions"><button class="primary-button" @click="editItem(currentItem); navigate(`/lists/${encodeURIComponent(currentItem.listId)}`)">Edit item</button><button class="text-button danger-text" @click="removeItem(currentItem)">Delete item</button></div></template><p v-else>This item could not be found.</p>
+          <template v-if="currentItem"><p class="eyebrow">{{ activeList?.title ?? 'Item' }}</p><h1>{{ currentItem.title }}</h1><p v-if="currentItem.statusId" class="item-meta">{{ statusForItem(currentItem) }}</p><p v-if="currentItem.date || activeList?.mode === 'date'" class="item-meta">{{ dateLabel(currentItem) }}</p><p v-if="currentItem.notes" class="item-notes">{{ currentItem.notes }}</p><p v-if="currentItem.externalUrl"><a :href="currentItem.externalUrl" target="_blank" rel="noopener noreferrer">Open external link</a></p><img v-if="currentItem.imageId && itemImageUrl" class="item-image" :src="itemImageUrl" :alt="`Image attached to ${currentItem.title}`"><p v-else-if="currentItem.imageId" class="form-hint" role="status">Image preview is unavailable, but the attachment remains saved.</p><div class="form-actions"><button class="primary-button" @click="editItem(currentItem); navigate(`/lists/${encodeURIComponent(currentItem.listId)}`)">Edit item</button><button class="text-button danger-text" @click="removeItem(currentItem)">Delete item</button></div></template><p v-else>This item could not be found.</p>
         </section>
         <section v-else class="message-card"><h1>Page not found</h1><a href="/" @click="followRoute($event, '/')">Go to home</a></section>
       </template>
