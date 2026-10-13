@@ -144,6 +144,19 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .primary-button { min-height: 46px; padding: 0 18px; border: 0; border-radius: 11px; color: white; background: #205d4b; font-weight: 700; }
 .primary-button:disabled { opacity: .6; cursor: wait; }
 .list-form, .list-card { padding: 18px; border: 1px solid #e5ebe6; border-radius: 16px; background: #fff; }
+.stage-editor { display: grid; gap: 12px; margin-bottom: 20px; padding: 18px; border: 1px solid #e5ebe6; border-radius: 16px; background: #fff; }
+.stage-editor h2, .stage-editor p { margin: 0; }
+.stage-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.stage-list li, .stage-add { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; }
+.stage-list li label { grid-column: 1 / -1; color: #596660; font-size: .82rem; }
+.stage-list input, .stage-add input, .stage-remove-prompt select { min-height: 42px; min-width: 0; padding: 8px 10px; border: 1px solid #ccd7cf; border-radius: 9px; color: #172321; background: white; }
+.stage-list li input { grid-column: 1 / 2; }
+.stage-list li button:last-child { grid-column: 1 / -1; justify-self: start; }
+.stage-list button:disabled { opacity: .45; cursor: not-allowed; }
+.stage-add { grid-template-columns: minmax(0, 1fr) auto; }
+.stage-add label { grid-column: 1 / -1; }
+.stage-remove-prompt { display: grid; gap: 10px; padding: 14px; border: 1px solid #ecc9c3; border-radius: 12px; background: #fffaf9; }
+.stage-remove-prompt label { display: grid; gap: 6px; }
 .list-form { display: grid; gap: 14px; margin-bottom: 18px; }
 .list-form h2 { margin: 0; font-size: 1.1rem; }
 .list-form label { display: grid; gap: 6px; color: #34433c; font-weight: 650; }

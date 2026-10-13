@@ -37,6 +37,10 @@ const recentImageUrls = ref(new Map<string, string>())
 const failedRecentImages = ref(new Set<string>())
 let recentPreviewRun = 0
 const itemError = ref('')
+const stageTitle = ref('')
+const stageError = ref('')
+const stageRemoval = ref<string | null>(null)
+const stageDestination = ref<string | null>(null)
 const itemFormOpen = ref(false)
 const editingItemId = ref<string | null>(null)
 const maxImageBytes = 5 * 1024 * 1024
@@ -182,6 +186,42 @@ async function deleteList(id: string): Promise<void> {
   } catch (error) { loadError.value = error instanceof StorageError ? error.message : 'List could not be deleted.' }
   finally { focusAfterDelete = false }
 }
+const activeStatuses = computed(() => activeList.value && data.value ? data.value.statuses.filter((status) => status.listId === activeList.value!.id).sort((a, b) => a.order - b.order) : [])
+async function addStage(): Promise<void> {
+  if (!activeList.value || !data.value || !stageTitle.value.trim()) return
+  stageError.value = ''
+  try {
+    await repository.addStatus({ id: createId(), listId: activeList.value.id, title: stageTitle.value.trim(), order: activeStatuses.value.length })
+    data.value = await repository.load(); stageTitle.value = ''
+  } catch (error) { stageError.value = error instanceof Error ? error.message : 'Stage could not be added.' }
+}
+async function renameStage(id: string, title: string): Promise<void> {
+  if (!title.trim()) return
+  stageError.value = ''
+  try { await repository.renameStatus(id, title.trim()); data.value = await repository.load() }
+  catch (error) { stageError.value = error instanceof Error ? error.message : 'Stage could not be renamed.' }
+}
+async function moveStage(index: number, offset: number): Promise<void> {
+  const status = activeStatuses.value[index]
+  if (!status) return
+  stageError.value = ''
+  try { await repository.reorderStatus(status.id, index + offset); data.value = await repository.load() }
+  catch (error) { stageError.value = error instanceof Error ? error.message : 'Stage order could not be saved.' }
+}
+function requestRemoveStage(id: string): void {
+  stageRemoval.value = id
+  const hasItems = data.value?.items.some((item) => item.statusId === id) ?? false
+  stageDestination.value = hasItems ? null : activeStatuses.value.find((status) => status.id !== id)?.id ?? null
+}
+const stageRemovalHasItems = computed(() => stageRemoval.value !== null && (data.value?.items.some((item) => item.statusId === stageRemoval.value) ?? false))
+async function removeStage(): Promise<void> {
+  if (!stageRemoval.value) return
+  stageError.value = ''
+  try {
+    await repository.deleteStatus(stageRemoval.value, stageDestination.value)
+    data.value = await repository.load(); stageRemoval.value = null
+  } catch (error) { stageError.value = error instanceof Error ? error.message : 'Stage could not be removed.' }
+}
 onMounted(loadSavedData)
 </script>
 
@@ -198,7 +238,7 @@ onMounted(loadSavedData)
             <h2>Create a list</h2>
             <label>List name<input v-model="title" required maxlength="100" autofocus placeholder="For example, Weekend plans"></label>
             <label>Mode<select v-model="mode"><option value="status">Manual</option><option value="date">Date</option></select></label>
-            <p class="form-hint">{{ mode === 'status' ? 'Manual lists use Done, In progress, and Up next stages. You can change item order anytime.' : 'Date lists organize items by their dates and do not use statuses.' }} Mode cannot be changed after creation.</p>
+            <p class="form-hint">{{ mode === 'status' ? 'Manual lists start with Done, In progress, and Up next stages. You can customize stages after creation.' : 'Date lists organize items by their dates and do not use statuses.' }} Mode cannot be changed after creation.</p>
             <label>Icon <span class="optional">(optional)</span><input v-model="icon" maxlength="8" placeholder="e.g. 📚" aria-label="Optional list icon"></label>
             <button class="primary-button" :disabled="saving || !title.trim()">Create list</button>
           </form>
@@ -213,6 +253,25 @@ onMounted(loadSavedData)
         <section v-else-if="route.name === 'list-detail'" class="lists-page">
           <a class="back-link" href="/" @click="followRoute($event, '/')">← All lists</a>
           <template v-if="activeList"><div class="page-heading"><div><p class="eyebrow">{{ activeList.mode === 'date' ? 'Date list' : 'Manual list' }}</p><h1>{{ activeList.icon }} {{ activeList.title }}</h1></div><button class="primary-button" @click="editItem()">＋ New item</button></div>
+            <section v-if="activeList.mode === 'status'" class="stage-editor" aria-labelledby="stage-heading">
+              <h2 id="stage-heading">Stages</h2>
+              <p class="form-hint">Customize the stages for this manual list. Items keep their list order when stages change.</p>
+              <ol class="stage-list"><li v-for="(status, index) in activeStatuses" :key="status.id">
+                <label :for="`stage-${status.id}`">Stage {{ index + 1 }}</label>
+                <input :id="`stage-${status.id}`" :value="status.title" maxlength="100" :aria-label="`Rename stage ${status.title}`" @change="renameStage(status.id, ($event.target as HTMLInputElement).value)">
+                <button type="button" class="text-button" :disabled="index === 0" :aria-label="`Move ${status.title} up`" @click="moveStage(index, -1)">↑</button>
+                <button type="button" class="text-button" :disabled="index === activeStatuses.length - 1" :aria-label="`Move ${status.title} down`" @click="moveStage(index, 1)">↓</button>
+                <button type="button" class="text-button danger-text" :disabled="activeStatuses.length <= 1" :aria-label="`Remove ${status.title}`" @click="requestRemoveStage(status.id)">Remove</button>
+              </li></ol>
+              <form class="stage-add" @submit.prevent="addStage"><label for="new-stage">Add a stage</label><input id="new-stage" v-model="stageTitle" maxlength="100" placeholder="Stage name"><button class="text-button" :disabled="!stageTitle.trim()">Add stage</button></form>
+              <p v-if="stageError" class="error-text" role="alert">{{ stageError }}</p>
+              <div v-if="stageRemoval" class="stage-remove-prompt" role="group" aria-label="Remove stage">
+                <p v-if="stageRemovalHasItems">Move items from “{{ activeStatuses.find((status) => status.id === stageRemoval)?.title }}” to another stage before removing it.</p>
+                <p v-else>Remove “{{ activeStatuses.find((status) => status.id === stageRemoval)?.title }}”?</p>
+                <label v-if="stageRemovalHasItems">Move items to<select v-model="stageDestination"><option disabled :value="null">Choose a destination</option><option v-for="status in activeStatuses.filter((entry) => entry.id !== stageRemoval)" :key="status.id" :value="status.id">{{ status.title }}</option></select></label>
+                <div class="form-actions"><button type="button" class="text-button" @click="stageRemoval = null">Cancel</button><button type="button" class="text-button danger-text" :disabled="stageRemovalHasItems && !stageDestination" @click="removeStage">Remove stage</button></div>
+              </div>
+            </section>
             <p v-if="itemError && !itemFormOpen" class="error-text" role="alert">{{ itemError }}</p>
             <form v-if="itemFormOpen" class="list-form" @submit.prevent="saveItem">
               <h2>{{ editingItemId ? 'Edit item' : 'New item' }}</h2><label>Title<input v-model="itemTitle" required maxlength="200" autofocus></label>

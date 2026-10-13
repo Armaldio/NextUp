@@ -1,4 +1,4 @@
-import { CURRENT_SCHEMA_VERSION, emptyAppData, type AppData, type Item } from './model.ts'
+import { CURRENT_SCHEMA_VERSION, emptyAppData, type AppData, type Item, type Status } from './model.ts'
 import { InvalidDataError, validateAppData } from './validation.ts'
 
 export class StorageError extends Error {
@@ -82,6 +82,59 @@ export class LocalDataRepository {
       if (error instanceof StorageError) throw error
       throw new StorageError(`Could not save item: ${errorMessage(error)}`, { cause: error })
     }
+  }
+
+  async addStatus(status: Status): Promise<void> {
+    const current = await this.readCurrent('add stage')
+    const list = current.lists.find((entry) => entry.id === status.listId)
+    if (!list || list.mode !== 'status') throw new StorageError('Only manual lists can have stages')
+    const ordered = current.statuses.filter((entry) => entry.listId === status.listId).sort((a, b) => a.order - b.order)
+    const next = { ...current, statuses: [...current.statuses, { ...status, order: ordered.length }] }
+    await this.writeCurrent(next, 'add stage')
+  }
+
+  async renameStatus(statusId: string, title: string): Promise<void> {
+    const current = await this.readCurrent('rename stage')
+    const status = current.statuses.find((entry) => entry.id === statusId)
+    if (!status) throw new StorageError(`Stage ${statusId} was not found`)
+    await this.writeCurrent({ ...current, statuses: current.statuses.map((entry) => entry.id === statusId ? { ...entry, title } : entry) }, 'rename stage')
+  }
+
+  async reorderStatus(statusId: string, targetIndex: number): Promise<void> {
+    const current = await this.readCurrent('reorder stage')
+    const status = current.statuses.find((entry) => entry.id === statusId)
+    if (!status) throw new StorageError(`Stage ${statusId} was not found`)
+    const ordered = current.statuses.filter((entry) => entry.listId === status.listId).sort((a, b) => a.order - b.order)
+    const from = ordered.findIndex((entry) => entry.id === statusId)
+    if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= ordered.length) throw new StorageError('Stage order is invalid')
+    ordered.splice(from, 1)
+    ordered.splice(targetIndex, 0, status)
+    const orderById = new Map(ordered.map((entry, index) => [entry.id, index]))
+    await this.writeCurrent({ ...current, statuses: current.statuses.map((entry) => entry.listId === status.listId ? { ...entry, order: orderById.get(entry.id)! } : entry) }, 'reorder stage')
+  }
+
+  async deleteStatus(statusId: string, destinationStatusId: string | null): Promise<void> {
+    const current = await this.readCurrent('remove stage')
+    const removed = current.statuses.find((entry) => entry.id === statusId)
+    if (!removed) throw new StorageError(`Stage ${statusId} was not found`)
+    const remaining = current.statuses.filter((entry) => entry.listId === removed.listId && entry.id !== statusId)
+    if (remaining.length === 0) throw new StorageError('A manual list must keep at least one stage')
+    const affected = current.items.filter((item) => item.statusId === statusId)
+    if (affected.length && !destinationStatusId) return
+    if (destinationStatusId && !remaining.some((entry) => entry.id === destinationStatusId)) throw new StorageError('Choose another stage in this list')
+    const statuses = current.statuses.filter((entry) => entry.id !== statusId).map((entry) => entry.listId === removed.listId ? { ...entry, order: entry.order > removed.order ? entry.order - 1 : entry.order } : entry)
+    const items = destinationStatusId ? current.items.map((item) => item.statusId === statusId ? { ...item, statusId: destinationStatusId } : item) : current.items
+    await this.writeCurrent({ ...current, statuses, items }, 'remove stage')
+  }
+
+  private async readCurrent(action: string): Promise<AppData> {
+    try { return validateAppData(migrateSnapshot(await this.driver.readSnapshot() ?? emptyAppData())) }
+    catch (error) { throw new StorageError(`Could not ${action}: ${errorMessage(error)}`, { cause: error }) }
+  }
+
+  private async writeCurrent(data: AppData, action: string): Promise<void> {
+    try { await this.driver.writeData(validateAppData(data), new Map()) }
+    catch (error) { throw new StorageError(`Could not ${action}: ${errorMessage(error)}`, { cause: error }) }
   }
 
   async deleteItem(itemId: string): Promise<void> {

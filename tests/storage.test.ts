@@ -81,6 +81,65 @@ test('persists ordered statuses, item positions, date values, and durable image 
   assert.equal(await (await reloadedRepository.getImage('image-1'))?.text(), 'image bytes')
 })
 
+test('supports per-list stage CRUD and persists arbitrary stage ordering', async () => {
+  const driver = new MemoryDriver()
+  const repository = new LocalDataRepository(driver)
+  await repository.save(sampleData, new Map([['image-1', new Blob(['image'])]]))
+
+  await repository.addStatus({ id: 'status-3', listId: 'list-1', title: 'Reading now', order: 99 })
+  await repository.addStatus({ id: 'status-4', listId: 'list-1', title: 'On hold', order: 99 })
+  await repository.renameStatus('status-3', 'In progress')
+  await repository.reorderStatus('status-4', 0)
+
+  const loaded = await repository.load()
+  assert.deepEqual(loaded.statuses.filter((status) => status.listId === 'list-1').sort((a, b) => a.order - b.order).map(({ id, title, order }) => ({ id, title, order })), [
+    { id: 'status-4', title: 'On hold', order: 0 },
+    { id: 'status-1', title: 'To read', order: 1 },
+    { id: 'status-2', title: 'Done', order: 2 },
+    { id: 'status-3', title: 'In progress', order: 3 },
+  ])
+  assert.deepEqual(loaded.items, sampleData.items)
+})
+
+test('stage removal requires reassignment and preserves every item field and position', async () => {
+  const driver = new MemoryDriver()
+  const repository = new LocalDataRepository(driver)
+  await repository.save(sampleData, new Map([['image-1', new Blob(['image'])]]))
+  const before = await repository.load()
+
+  await repository.deleteStatus('status-1', null)
+  assert.deepEqual(await repository.load(), before)
+  await repository.deleteStatus('status-1', 'status-2')
+
+  const loaded = await repository.load()
+  assert.deepEqual(loaded.items, [{ ...sampleData.items[0], statusId: 'status-2' }])
+  assert.deepEqual(loaded.statuses, [{ ...sampleData.statuses[1], order: 0 }])
+  assert.equal(await driver.images.get('image-1')?.text(), 'image')
+  await assert.rejects(() => repository.deleteStatus('status-2', null), /keep at least one stage/i)
+  assert.deepEqual(await repository.load(), loaded)
+})
+
+test('removes an empty stage without requiring a destination', async () => {
+  const driver = new MemoryDriver()
+  const repository = new LocalDataRepository(driver)
+  await repository.save(sampleData, new Map([['image-1', new Blob(['image'])]]))
+
+  await repository.deleteStatus('status-2', null)
+
+  const loaded = await repository.load()
+  assert.deepEqual(loaded.statuses, [sampleData.statuses[0]])
+  assert.deepEqual(loaded.items, sampleData.items)
+})
+
+test('date lists cannot gain stages through the repository helpers', async () => {
+  const driver = new MemoryDriver()
+  const repository = new LocalDataRepository(driver)
+  const dateList: AppData = { schemaVersion: 3, lists: [{ id: 'calendar', title: 'Calendar', mode: 'date', sortOrder: 0, icon: null }], statuses: [], items: [] }
+  await repository.save(dateList)
+  await assert.rejects(() => repository.addStatus({ id: 'stage', listId: 'calendar', title: 'Stage', order: 0 }), /only manual lists/i)
+  assert.deepEqual(await repository.load(), dateList)
+})
+
 test('rejects malformed snapshots and broken list, status, and image references', async (t) => {
   const invalidCases: { snapshot: unknown; expectedMessage: RegExp }[] = [
     { snapshot: { schemaVersion: 3, lists: 'not an array', statuses: [], items: [] }, expectedMessage: /must be arrays/i },
