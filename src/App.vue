@@ -44,9 +44,11 @@ const itemDateValue = ref('')
 const itemImageId = ref<string | null>(null)
 const itemImage = ref<Blob | null>(null)
 const itemImageUrl = ref('')
-const recentImageUrls = ref(new Map<string, string>())
-const failedRecentImages = ref(new Set<string>())
-let recentPreviewRun = 0
+const homeImageUrls = ref(new Map<string, string>())
+const failedHomeImages = ref(new Set<string>())
+const initializedHomeRails = new Set<string>()
+const homeRailPositions = new Map<string, number>()
+let homePreviewRun = 0
 const itemError = ref('')
 const stageTitle = ref('')
 const stageError = ref('')
@@ -67,6 +69,69 @@ function dateLabel(item: Item): string {
   if (!item.date) return 'No date'
   const value = item.date.kind === 'date-only' ? item.date.value : item.date.value.replace('T', ' ')
   return `${value} · ${item.date.kind === 'date-only' ? 'Date only' : 'Local time'}`
+}
+function homeItemsForList(list: AppData['lists'][number]): { item: Item; statusTitle: string }[] {
+  const items = data.value?.items.filter((item) => item.listId === list.id) ?? []
+  if (list.mode === 'date') return orderItemsForList(items, 'date').map((item) => ({ item, statusTitle: '' }))
+  const statuses = (data.value?.statuses ?? []).filter((status) => status.listId === list.id).sort((a, b) => a.order - b.order)
+  return [
+    ...statuses.flatMap((status) => orderItemsForList(items.filter((item) => item.statusId === status.id), 'status').map((item) => ({ item, statusTitle: status.title }))),
+    ...orderItemsForList(items.filter((item) => item.statusId === null), 'status').map((item) => ({ item, statusTitle: 'No stage' })),
+  ]
+}
+function homeItemDate(item: Item): string {
+  if (!item.date) return 'No date'
+  return item.date.kind === 'date-only' ? item.date.value : item.date.value.replace('T', ' ')
+}
+function initialHomeItem(list: AppData['lists'][number]): Item | undefined {
+  const entries = homeItemsForList(list)
+  if (list.mode === 'status') {
+    const statuses = (data.value?.statuses ?? []).filter((status) => status.listId === list.id).sort((a, b) => a.order - b.order)
+    const targetStatuses = statuses.filter((status) => ['in progress', 'up next'].includes(status.title.trim().toLowerCase()))
+    return entries.find((entry) => targetStatuses.some((status) => status.id === entry.item.statusId))?.item
+  }
+  const datedItems = entries.map((entry) => entry.item).filter((item): item is Item & { date: ItemDate } => Boolean(item.date))
+  if (!datedItems.length) return undefined
+  const now = new Date()
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+  const localNow = `${today}T${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
+  return datedItems.find((item) => (item.date.kind === 'date-only' ? item.date.value >= today : item.date.value >= localNow)) ?? datedItems[0]
+}
+function registerHomeRail(list: AppData['lists'][number], element: Element | null): void {
+  if (!element || !(element instanceof HTMLElement)) return
+  const rail = element
+  if (initializedHomeRails.has(list.id)) {
+    rail.scrollLeft = homeRailPositions.get(list.id) ?? rail.scrollLeft
+    return
+  }
+  const target = initialHomeItem(list)
+  if (!target) return
+  initializedHomeRails.add(list.id)
+  void nextTick(() => requestAnimationFrame(() => {
+    const card = rail.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(target.id)}"]`)
+    if (!card) return
+    const cardLeft = card.getBoundingClientRect().left - rail.getBoundingClientRect().left + rail.scrollLeft
+    rail.scrollLeft = Math.max(0, cardLeft - (rail.clientWidth - card.offsetWidth) / 2)
+    homeRailPositions.set(list.id, rail.scrollLeft)
+  }))
+}
+function rememberHomeRailPosition(listId: string, event: Event): void {
+  homeRailPositions.set(listId, (event.currentTarget as HTMLElement).scrollLeft)
+}
+function scrollHomeRailWithKeyboard(event: KeyboardEvent): void {
+  if (event.target !== event.currentTarget) return
+  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+  event.preventDefault()
+  ;(event.currentTarget as HTMLElement).scrollBy({ left: event.key === 'ArrowRight' ? 240 : -240, behavior: 'smooth' })
+}
+function scrollHomeRailWithWheel(event: WheelEvent): void {
+  if (event.deltaX !== 0 || event.deltaY === 0) return
+  const rail = event.currentTarget as HTMLElement
+  const maxScrollLeft = rail.scrollWidth - rail.clientWidth
+  if (maxScrollLeft <= 0) return
+  if (event.deltaY > 0 ? rail.scrollLeft >= maxScrollLeft : rail.scrollLeft <= 0) return
+  event.preventDefault()
+  rail.scrollLeft += event.deltaY
 }
 function detailPath(item: Item): string { return `/lists/${encodeURIComponent(item.listId)}/items/${encodeURIComponent(item.id)}` }
 function clearItemForm(): void { itemFormOpen.value = false; editingItemId.value = null; itemTitle.value = ''; itemNotes.value = ''; itemLink.value = ''; itemStatusId.value = null; itemDateKind.value = 'none'; itemDateValue.value = ''; itemImageId.value = null; itemImage.value = null; itemError.value = '' }
@@ -153,48 +218,54 @@ async function loadDetailImage(): Promise<void> {
     if (blob) itemImageUrl.value = URL.createObjectURL(blob)
   } catch { itemImageUrl.value = '' }
 }
-function clearRecentImageUrls(): void {
-  for (const url of recentImageUrls.value.values()) URL.revokeObjectURL(url)
-  recentImageUrls.value = new Map()
+function clearHomeImageUrls(): void {
+  for (const url of homeImageUrls.value.values()) URL.revokeObjectURL(url)
+  homeImageUrls.value = new Map()
 }
-async function loadRecentImagePreviews(): Promise<void> {
-  const run = ++recentPreviewRun
-  clearRecentImageUrls()
-  failedRecentImages.value = new Set()
+async function loadHomeImagePreviews(): Promise<void> {
+  const run = ++homePreviewRun
+  clearHomeImageUrls()
+  failedHomeImages.value = new Set()
   if (route.value.name !== 'home' || !data.value) return
-  const recentItems = data.value.items.slice(-5).reverse().filter((item) => item.imageId)
+  const imageItems = data.value.items.filter((item) => item.imageId)
   const urls = new Map<string, string>()
   const failed = new Set<string>()
-  await Promise.all(recentItems.map(async (item) => {
+  await Promise.all(imageItems.map(async (item) => {
     try {
       const blob = item.imageId ? await repository.getImage(item.imageId) : undefined
       if (blob) urls.set(item.id, URL.createObjectURL(blob))
       else failed.add(item.id)
     } catch { failed.add(item.id) }
   }))
-  if (run !== recentPreviewRun || route.value.name !== 'home') {
+  if (run !== homePreviewRun || route.value.name !== 'home') {
     for (const url of urls.values()) URL.revokeObjectURL(url)
     return
   }
-  recentImageUrls.value = urls
-  failedRecentImages.value = failed
+  homeImageUrls.value = urls
+  failedHomeImages.value = failed
 }
-function failRecentImage(itemId: string, event: Event): void {
+function failHomeImage(itemId: string, event: Event): void {
   const renderedUrl = (event.currentTarget as HTMLImageElement).getAttribute('src')
-  const url = recentImageUrls.value.get(itemId)
+  const url = homeImageUrls.value.get(itemId)
   if (!url || renderedUrl !== url) return
   URL.revokeObjectURL(url)
-  const urls = new Map(recentImageUrls.value)
+  const urls = new Map(homeImageUrls.value)
   urls.delete(itemId)
-  recentImageUrls.value = urls
-  failedRecentImages.value = new Set([...failedRecentImages.value, itemId])
+  homeImageUrls.value = urls
+  failedHomeImages.value = new Set([...failedHomeImages.value, itemId])
+}
+async function createItemFromHome(list: AppData['lists'][number]): Promise<void> {
+  if (snapshotMutationPending.value) return
+  navigate(`/lists/${encodeURIComponent(list.id)}`)
+  await nextTick()
+  editItem()
 }
 watch([currentItem, data, route], loadDetailImage)
-watch([data, route], loadRecentImagePreviews)
+watch([data, route], loadHomeImagePreviews)
 onUnmounted(() => {
   if (itemImageUrl.value) URL.revokeObjectURL(itemImageUrl.value)
-  recentPreviewRun += 1
-  clearRecentImageUrls()
+  homePreviewRun += 1
+  clearHomeImageUrls()
 })
 
 async function loadSavedData(): Promise<void> {
@@ -325,7 +396,25 @@ onMounted(loadSavedData)
             <div class="list-actions"><label class="sr-only" :for="`rename-${list.id}`">Rename {{ list.title }}</label><input :id="`rename-${list.id}`" :value="list.title" :disabled="snapshotMutationPending" :aria-label="`Rename ${list.title}`" @change="renameList(list.id, ($event.target as HTMLInputElement).value)"><button class="text-button danger-text" :disabled="snapshotMutationPending" :aria-label="`Delete ${list.title}`" @click="openDelete(list.id, $event)">Delete</button></div>
             <dialog v-if="deleting === list.id" ref="deleteDialog" class="confirm-box" :aria-labelledby="`delete-title-${list.id}`" @cancel.prevent="cancelDelete"><h2 :id="`delete-title-${list.id}`">Delete “{{ list.title }}”?</h2><p>This permanently deletes this list, its {{ data!.items.filter((item) => item.listId === list.id).length }} items, their images when not shared with another list, and its statuses.</p><div><button type="button" class="text-button" data-dialog-cancel :disabled="snapshotMutationPending" @click="cancelDelete">Cancel</button><button type="button" class="text-button danger-text" :disabled="snapshotMutationPending" @click="deleteList(list.id)">Delete list</button></div></dialog>
           </article></div>
-          <section v-if="data!.items.length" class="home-items"><h2>Recent items</h2><a v-for="item in data!.items.slice(-5).reverse()" :key="item.id" class="recent-item" :href="detailPath(item)" @click="followRoute($event, detailPath(item))"><img v-if="item.imageId && recentImageUrls.has(item.id)" class="recent-item-image" :src="recentImageUrls.get(item.id)" :alt="`Image attached to ${item.title}`" @error.prevent="failRecentImage(item.id, $event)"><span v-else class="recent-item-fallback" aria-hidden="true">{{ item.imageId && failedRecentImages.has(item.id) ? 'Image unavailable' : item.imageId ? 'Loading image…' : 'No image' }}</span><span class="recent-item-text"><strong>{{ item.title }}</strong><small>{{ data!.lists.find((list) => list.id === item.listId)?.title }}</small></span></a></section>
+          <section v-for="list in lists" :key="`rail-${list.id}`" class="home-list-rail" :aria-labelledby="`home-list-${list.id}`">
+            <div class="home-rail-heading">
+              <h2 class="home-list-heading" :id="`home-list-${list.id}`"><a class="home-list-title" :href="`/lists/${encodeURIComponent(list.id)}`" @click="followRoute($event, `/lists/${encodeURIComponent(list.id)}`)">
+                <span class="list-icon" aria-hidden="true">{{ list.icon || (list.mode === 'date' ? '◷' : '☷') }}</span>
+                <span><strong>{{ list.title }}</strong><small>{{ list.mode === 'date' ? 'Date list' : 'Manual list' }}</small></span>
+              </a></h2>
+              <button type="button" class="text-button home-create-item" :disabled="snapshotMutationPending" @click="createItemFromHome(list)">＋ Item</button>
+            </div>
+            <div v-if="homeItemsForList(list).length" :ref="(element) => registerHomeRail(list, element as Element | null)" class="home-item-rail" role="region" tabindex="0" :aria-label="`${list.title} items`" @scroll.passive="rememberHomeRailPosition(list.id, $event)" @keydown="scrollHomeRailWithKeyboard" @wheel="scrollHomeRailWithWheel">
+              <article v-for="entry in homeItemsForList(list)" :key="entry.item.id" class="home-item-card" :data-item-id="entry.item.id">
+                <a class="home-item-link" :href="detailPath(entry.item)" :aria-label="`${entry.item.title}, ${list.mode === 'date' ? homeItemDate(entry.item) : entry.statusTitle || 'No stage'}`" @click="followRoute($event, detailPath(entry.item))">
+                  <img v-if="entry.item.imageId && homeImageUrls.has(entry.item.id)" class="home-item-image" :src="homeImageUrls.get(entry.item.id)" :alt="`Image attached to ${entry.item.title}`" @error.prevent="failHomeImage(entry.item.id, $event)">
+                  <span v-else class="home-item-image home-item-fallback" aria-hidden="true">{{ entry.item.imageId && failedHomeImages.has(entry.item.id) ? 'Image unavailable' : entry.item.imageId ? 'Loading image…' : 'No image' }}</span>
+                  <span class="home-item-copy"><strong>{{ entry.item.title }}</strong><small v-if="list.mode === 'date'">{{ homeItemDate(entry.item) }}</small><small v-else>{{ entry.statusTitle || 'No stage' }}</small></span>
+                </a>
+              </article>
+            </div>
+            <div v-else class="home-rail-empty"><p>No items yet.</p><button type="button" class="text-button" :disabled="snapshotMutationPending" @click="createItemFromHome(list)">Add the first item</button></div>
+          </section>
           <section v-if="!creating && lists.length === 0" class="message-card empty-state"><span class="empty-mark" aria-hidden="true">＋</span><h2>Start with a list</h2><p>Create a manual list for flexible stages or a date list for things tied to a day.</p><button class="primary-button" :disabled="snapshotMutationPending" @click="creating = true">Create your first list</button></section>
         </section>
         <section v-else-if="route.name === 'list-detail'" class="lists-page">
