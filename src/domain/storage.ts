@@ -26,10 +26,10 @@ export class LocalDataRepository {
       const raw = await this.driver.readSnapshot()
       if (raw === undefined) return emptyAppData()
       const data = validateAppData(migrateSnapshot(raw))
-      if (isRecord(raw) && raw.schemaVersion === 0) await this.driver.writeData(data, new Map())
       for (const id of imageIds(data)) {
         if (!(await this.driver.readImage(id))) throw new InvalidDataError(`Item image ${id} is missing`)
       }
+      if (isRecord(raw) && raw.schemaVersion === 0) await this.driver.writeData(data, new Map())
       return data
     } catch (error) {
       if (error instanceof StorageError) throw error
@@ -73,17 +73,28 @@ function errorMessage(error: unknown): string {
 }
 
 function migrateSnapshot(value: unknown): unknown {
-  if (typeof value !== 'object' || value === null || !('schemaVersion' in value)) return value
-  const record = value as Record<string, unknown>
+  if (!isRecord(value) || !('schemaVersion' in value)) return value
+  const record = value
   if (record.schemaVersion !== 0) return value
+  // The repository history predating this model has no stored domain shape to infer from.
+  // Only migrate a complete snapshot with the current fields, changing its version marker.
+  assertKeys(record, ['schemaVersion', 'lists', 'statuses', 'items'], [], 'Version 0 snapshot')
   if (!Array.isArray(record.lists) || !Array.isArray(record.statuses) || !Array.isArray(record.items)) {
     throw new InvalidDataError('Version 0 snapshot is malformed')
   }
-  return {
-    schemaVersion: 1,
-    lists: record.lists.map((list, index) => isRecord(list) ? { ...list, mode: 'status', sortOrder: index } : list),
-    statuses: record.statuses.map((status, index) => isRecord(status) ? { ...status, order: index } : status),
-    items: record.items.map((item, index) => isRecord(item) ? { ...item, imageId: null, position: index } : item),
+  for (const list of record.lists) assertKeys(list, ['id', 'title', 'mode', 'sortOrder'], [], 'Version 0 list')
+  for (const status of record.statuses) assertKeys(status, ['id', 'listId', 'title', 'order'], [], 'Version 0 status')
+  for (const item of record.items) {
+    assertKeys(item, ['id', 'listId', 'title', 'notes', 'imageId', 'statusId', 'position'], ['date'], 'Version 0 item')
+  }
+  return { ...record, schemaVersion: 1 }
+}
+
+function assertKeys(value: unknown, required: string[], optional: string[], label: string): void {
+  if (!isRecord(value)) throw new InvalidDataError(`${label} must be an object`)
+  const allowed = new Set([...required, ...optional])
+  if (Object.keys(value).some((key) => !allowed.has(key)) || required.some((key) => !(key in value))) {
+    throw new InvalidDataError(`${label} has an ambiguous or unsupported shape`)
   }
 }
 
@@ -120,10 +131,21 @@ export class IndexedDbDriver implements LocalDataDriver {
     const database = await this.open()
     try {
       const transaction = database.transaction([SNAPSHOT_STORE, IMAGE_STORE], 'readwrite')
-      transaction.objectStore(SNAPSHOT_STORE).put(snapshot, SNAPSHOT_KEY)
-      const imageStore = transaction.objectStore(IMAGE_STORE)
-      for (const [id, image] of images) imageStore.put(image, id)
-      await transactionDone(transaction)
+      const completed = transactionDone(transaction)
+      try {
+        transaction.objectStore(SNAPSHOT_STORE).put(snapshot, SNAPSHOT_KEY)
+        const imageStore = transaction.objectStore(IMAGE_STORE)
+        for (const [id, image] of images) imageStore.put(image, id)
+        await completed
+      } catch (error) {
+        try {
+          transaction.abort()
+        } catch {
+          // The transaction may already have aborted or committed.
+        }
+        await completed.catch(() => undefined)
+        throw error
+      }
     } finally {
       database.close()
     }

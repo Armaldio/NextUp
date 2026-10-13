@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { AppData } from '../src/domain/model.ts'
 import { IndexedDbDriver, LocalDataRepository, StorageError, type LocalDataDriver } from '../src/domain/storage.ts'
-import { validateAppData } from '../src/domain/validation.ts'
+import { InvalidDataError, validateAppData } from '../src/domain/validation.ts'
 
 const sampleData: AppData = {
   schemaVersion: 1,
@@ -27,6 +27,7 @@ class MemoryDriver implements LocalDataDriver {
   snapshot: unknown | undefined
   images = new Map<string, Blob>()
   unavailable = false
+  writeCount = 0
 
   async readSnapshot(): Promise<unknown | undefined> {
     this.checkAvailable()
@@ -35,8 +36,9 @@ class MemoryDriver implements LocalDataDriver {
 
   async writeData(snapshot: AppData, images: ReadonlyMap<string, Blob>): Promise<void> {
     this.checkAvailable()
+    this.writeCount += 1
     this.snapshot = structuredClone(snapshot)
-    this.images = new Map(images)
+    this.images = new Map([...this.images, ...images])
   }
 
   async readImage(id: string): Promise<Blob | undefined> {
@@ -73,23 +75,32 @@ test('persists ordered statuses, item positions, date values, and durable image 
 })
 
 test('rejects malformed snapshots and broken list, status, and image references', async (t) => {
-  const invalidSnapshots: unknown[] = [
-    { schemaVersion: 1, lists: 'not an array', statuses: [], items: [] },
-    { ...sampleData, items: [{ ...sampleData.items[0], listId: 'missing-list' }] },
-    { ...sampleData, items: [{ ...sampleData.items[0], statusId: 'missing-status' }] },
-    { ...sampleData, items: [{ ...sampleData.items[0], imageId: 'missing-image' }] },
-    { ...sampleData, statuses: [{ ...sampleData.statuses[0], listId: 'missing-list' }] },
-    { ...sampleData, items: [{ ...sampleData.items[0], date: { kind: 'date-only', value: '2026-02-30' } }] },
-    { ...sampleData, statuses: [...sampleData.statuses, { ...sampleData.statuses[0], id: 'list-1' }] },
-    { ...sampleData, statuses: [...sampleData.statuses, { ...sampleData.statuses[1], id: 'status-3', order: 0 }] },
-    { ...sampleData, items: [...sampleData.items, { ...sampleData.items[0], id: 'item-2' }] },
+  const invalidCases: { snapshot: unknown; expectedMessage: RegExp }[] = [
+    { snapshot: { schemaVersion: 1, lists: 'not an array', statuses: [], items: [] }, expectedMessage: /must be arrays/i },
+    { snapshot: { ...sampleData, items: [{ ...sampleData.items[0], listId: 'missing-list' }] }, expectedMessage: /missing list/i },
+    { snapshot: { ...sampleData, items: [{ ...sampleData.items[0], statusId: 'missing-status' }] }, expectedMessage: /invalid status/i },
+    { snapshot: { ...sampleData, items: [{ ...sampleData.items[0], imageId: 'missing-image' }] }, expectedMessage: /image missing-image is missing/i },
+    { snapshot: { ...sampleData, statuses: [{ ...sampleData.statuses[0], listId: 'missing-list' }] }, expectedMessage: /status .* missing list/i },
+    { snapshot: { ...sampleData, items: [{ ...sampleData.items[0], date: { kind: 'date-only', value: '2026-02-30' } }] }, expectedMessage: /date is invalid/i },
+    { snapshot: { ...sampleData, statuses: [...sampleData.statuses, { ...sampleData.statuses[0], id: 'list-1' }] }, expectedMessage: /duplicate id/i },
+    { snapshot: { ...sampleData, statuses: [...sampleData.statuses, { ...sampleData.statuses[1], id: 'status-3', order: 0 }] }, expectedMessage: /duplicate status order/i },
+    { snapshot: { ...sampleData, items: [...sampleData.items, { ...sampleData.items[0], id: 'item-2' }] }, expectedMessage: /duplicate item position/i },
   ]
 
-  for (const snapshot of invalidSnapshots) {
-    await t.test('invalid snapshot is reported', async () => {
+  for (const { snapshot, expectedMessage } of invalidCases) {
+    await t.test(`rejects snapshot: ${expectedMessage}`, async () => {
       const driver = new MemoryDriver()
-      driver.snapshot = snapshot
-      await assert.rejects(() => new LocalDataRepository(driver).load(), StorageError)
+      driver.snapshot = structuredClone(snapshot)
+      driver.images.set('image-1', new Blob(['existing image'], { type: 'image/png' }))
+      const before = structuredClone(driver.snapshot)
+      await assert.rejects(
+        () => new LocalDataRepository(driver).load(),
+        (error: unknown) => error instanceof StorageError
+          && error.cause instanceof InvalidDataError
+          && expectedMessage.test(error.cause.message),
+      )
+      assert.deepEqual(driver.snapshot, before)
+      assert.equal(driver.writeCount, 0)
     })
   }
 })
@@ -124,22 +135,45 @@ test('rejects an unsupported schema version without clearing stored data', async
   assert.deepEqual(driver.snapshot, original)
 })
 
-test('migrates the original unversioned model while preserving user content', async () => {
+test('migrates a complete v0 snapshot without changing model fields or image data', async () => {
   const driver = new MemoryDriver()
-  driver.snapshot = {
-    schemaVersion: 0,
-    lists: [{ id: 'old-list', title: 'Old list' }],
-    statuses: [{ id: 'old-status', listId: 'old-list', title: 'Open' }],
-    items: [{ id: 'old-item', listId: 'old-list', title: 'Old item', notes: 'Keep me', statusId: 'old-status' }],
-  }
+  const original = { ...sampleData, schemaVersion: 0 }
+  const image = new Blob(['old image'], { type: 'image/png' })
+  driver.snapshot = structuredClone(original)
+  driver.images.set('image-1', image)
 
-  assert.deepEqual(await new LocalDataRepository(driver).load(), {
-    schemaVersion: 1,
-    lists: [{ id: 'old-list', title: 'Old list', mode: 'status', sortOrder: 0 }],
-    statuses: [{ id: 'old-status', listId: 'old-list', title: 'Open', order: 0 }],
-    items: [{ id: 'old-item', listId: 'old-list', title: 'Old item', notes: 'Keep me', imageId: null, statusId: 'old-status', position: 0 }],
-  })
-  assert.equal((driver.snapshot as AppData).schemaVersion, 1)
+  assert.deepEqual(await new LocalDataRepository(driver).load(), sampleData)
+  assert.deepEqual(driver.snapshot, sampleData)
+  assert.equal(await driver.images.get('image-1')?.text(), 'old image')
+  assert.equal(driver.writeCount, 1)
+})
+
+test('rejects ambiguous or invalid v0 data without persisting a migration', async (t) => {
+  const ambiguous = structuredClone({ ...sampleData, schemaVersion: 0 }) as Record<string, unknown>
+  ambiguous.lists = [{ id: 'list-1', title: 'Missing historical mode' }]
+  const missingImage = structuredClone({ ...sampleData, schemaVersion: 0 })
+  const unknownShape = { ...sampleData, schemaVersion: 0, legacyPayload: { content: 'unrecognized' } }
+  const cases = [
+    { value: ambiguous, expectedMessage: /ambiguous or unsupported shape/i },
+    { value: missingImage, expectedMessage: /image image-1 is missing/i },
+    { value: unknownShape, expectedMessage: /ambiguous or unsupported shape/i },
+  ]
+
+  for (const { value, expectedMessage } of cases) {
+    await t.test(`does not write: ${expectedMessage}`, async () => {
+      const driver = new MemoryDriver()
+      driver.snapshot = structuredClone(value)
+      const before = structuredClone(driver.snapshot)
+      await assert.rejects(
+        () => new LocalDataRepository(driver).load(),
+        (error: unknown) => error instanceof StorageError
+          && error.cause instanceof InvalidDataError
+          && expectedMessage.test(error.cause.message),
+      )
+      assert.deepEqual(driver.snapshot, before)
+      assert.equal(driver.writeCount, 0)
+    })
+  }
 })
 
 test('reports storage unavailability as a recoverable error', async () => {
