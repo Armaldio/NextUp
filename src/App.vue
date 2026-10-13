@@ -23,8 +23,14 @@ let focusAfterDelete = false
 const saving = ref(false)
 const lists = computed(() => [...(data.value?.lists ?? [])].sort((a, b) => a.sortOrder - b.sortOrder))
 const activeList = computed(() => { const currentRoute = route.value; return currentRoute.name === 'list-detail' || currentRoute.name === 'item-detail' ? data.value?.lists.find((list) => list.id === currentRoute.listId) : undefined })
+const listTitle = ref('')
+watch(activeList, (list) => { listTitle.value = list?.title ?? '' }, { immediate: true })
 const activeItems = computed(() => orderItemsForList(data.value?.items.filter((item) => item.listId === activeList.value?.id) ?? [], activeList.value?.mode ?? 'status'))
 const undatedItems = computed(() => activeList.value?.mode === 'date' ? activeItems.value.filter((item) => !item.date) : [])
+const dateItemSections = computed(() => [
+  { id: 'dated', title: 'Dated', items: activeList.value?.mode === 'date' ? activeItems.value.filter((item) => Boolean(item.date)) : [] },
+  { id: 'undated', title: 'Undated', items: undatedItems.value },
+])
 const manualStages = computed(() => {
   if (!activeList.value || activeList.value.mode !== 'status' || !data.value) return []
   const items = data.value.items.filter((item) => item.listId === activeList.value!.id)
@@ -54,6 +60,9 @@ const stageTitle = ref('')
 const stageError = ref('')
 const stageRemoval = ref<string | null>(null)
 const stageDestination = ref<string | null>(null)
+const draggingItemId = ref<string | null>(null)
+const dragTargetIndex = ref<number | null>(null)
+const reorderAnnouncement = ref('')
 const snapshotMutationPending = ref(false)
 const itemFormOpen = ref(false)
 const editingItemId = ref<string | null>(null)
@@ -189,12 +198,18 @@ async function moveUndatedItem(item: Item, offset: number): Promise<void> {
   finally { endSnapshotMutation() }
 }
 async function moveManualItem(item: Item, offset: number): Promise<void> {
+  const stage = manualStages.value.find((entry) => entry.id === item.statusId)
+  const index = stage?.items.findIndex((entry) => entry.id === item.id) ?? -1
+  if (index < 0) return
+  await moveManualItemTo(item, index + offset)
+}
+async function moveManualItemTo(item: Item, targetIndex: number): Promise<void> {
   if (snapshotMutationPending.value) return
   const stage = manualStages.value.find((entry) => entry.id === item.statusId)
   if (!activeList.value || activeList.value.mode !== 'status' || !stage) return
   const index = stage.items.findIndex((entry) => entry.id === item.id)
-  const targetIndex = index + offset
   if (index < 0 || targetIndex < 0 || targetIndex >= stage.items.length) return
+  if (index === targetIndex) return
   const orderedIds = stage.items.map((entry) => entry.id)
   const [movingId] = orderedIds.splice(index, 1)
   orderedIds.splice(targetIndex, 0, movingId!)
@@ -203,9 +218,31 @@ async function moveManualItem(item: Item, offset: number): Promise<void> {
   try {
     await repository.reorderManualStageItems(activeList.value.id, stage.id, orderedIds)
     data.value = await repository.load()
+    reorderAnnouncement.value = `Moved ${item.title} to position ${targetIndex + 1} in ${stage.title}.`
   } catch (error) { itemError.value = error instanceof Error ? error.message : 'Manual item order could not be saved.' }
   finally { endSnapshotMutation() }
 }
+function startManualDrag(item: Item, index: number, event: PointerEvent): void {
+  if (snapshotMutationPending.value || event.button !== 0) return
+  draggingItemId.value = item.id
+  dragTargetIndex.value = index
+  ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+}
+function updateManualDrag(stage: typeof manualStages.value[number], event: PointerEvent): void {
+  if (!draggingItemId.value || !stage.items.some((item) => item.id === draggingItemId.value)) return
+  const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-manual-item-index]')
+  if (!target || !stage.items.some((item) => item.id === target.dataset.itemId)) return
+  const targetIndex = Number(target.dataset.manualItemIndex)
+  if (Number.isInteger(targetIndex)) dragTargetIndex.value = targetIndex
+}
+async function finishManualDrag(stage: typeof manualStages.value[number]): Promise<void> {
+  const item = stage.items.find((entry) => entry.id === draggingItemId.value)
+  const targetIndex = dragTargetIndex.value
+  draggingItemId.value = null
+  dragTargetIndex.value = null
+  if (item && targetIndex !== null) await moveManualItemTo(item, targetIndex)
+}
+function cancelManualDrag(): void { draggingItemId.value = null; dragTargetIndex.value = null }
 async function loadDetailImage(): Promise<void> {
   if (itemImageUrl.value) URL.revokeObjectURL(itemImageUrl.value)
   itemImageUrl.value = ''
@@ -322,10 +359,15 @@ async function deleteList(id: string): Promise<void> {
     focusAfterDelete = true
     deleting.value = null
     await loadSavedData()
+    if (route.value.name !== 'home') navigate('/')
     await nextTick()
     listHeading.value?.focus()
   } catch (error) { loadError.value = error instanceof StorageError ? error.message : 'List could not be deleted.' }
   finally { focusAfterDelete = false; endSnapshotMutation() }
+}
+async function saveListTitle(): Promise<void> {
+  if (!activeList.value || !listTitle.value.trim()) { listTitle.value = activeList.value?.title ?? ''; return }
+  await renameList(activeList.value.id, listTitle.value)
 }
 const activeStatuses = computed(() => activeList.value && data.value ? data.value.statuses.filter((status) => status.listId === activeList.value!.id).sort((a, b) => a.order - b.order) : [])
 async function addStage(): Promise<void> {
@@ -420,6 +462,13 @@ onMounted(loadSavedData)
         <section v-else-if="route.name === 'list-detail'" class="lists-page">
           <a class="back-link" href="/" @click="followRoute($event, '/')">← All lists</a>
           <template v-if="activeList"><div class="page-heading"><div><p class="eyebrow">{{ activeList.mode === 'date' ? 'Date list' : 'Manual list' }}</p><h1>{{ activeList.icon }} {{ activeList.title }}</h1></div><button class="primary-button" :disabled="snapshotMutationPending" @click="editItem()">＋ New item</button></div>
+            <section class="list-settings" aria-labelledby="list-settings-heading">
+              <h2 id="list-settings-heading">List settings</h2>
+              <label :for="`list-title-${activeList.id}`">List title<input :id="`list-title-${activeList.id}`" v-model="listTitle" maxlength="100" :disabled="snapshotMutationPending" @change="saveListTitle"></label>
+              <p class="form-hint">Mode: {{ activeList.mode === 'date' ? 'Date' : 'Manual' }}. List mode is fixed after creation.</p>
+              <button type="button" class="text-button danger-text" :disabled="snapshotMutationPending" @click="openDelete(activeList.id, $event)">Delete list</button>
+              <dialog v-if="deleting === activeList.id" ref="deleteDialog" class="confirm-box" :aria-labelledby="`delete-title-${activeList.id}`" @cancel.prevent="cancelDelete"><h2 :id="`delete-title-${activeList.id}`">Delete “{{ activeList.title }}”?</h2><p>This permanently deletes this list, its {{ data!.items.filter((item) => item.listId === activeList!.id).length }} items, their images when not shared with another list, and its stages.</p><div><button type="button" class="text-button" data-dialog-cancel :disabled="snapshotMutationPending" @click="cancelDelete">Cancel</button><button type="button" class="text-button danger-text" :disabled="snapshotMutationPending" @click="deleteList(activeList.id)">Delete list</button></div></dialog>
+            </section>
             <section v-if="activeList.mode === 'status'" class="stage-editor" aria-labelledby="stage-heading">
               <h2 id="stage-heading">Stages</h2>
               <p class="form-hint">Customize the stages for this manual list. Items keep their list order when stages change.</p>
@@ -451,15 +500,22 @@ onMounted(loadSavedData)
               <p v-if="itemImageId && !itemImage" class="form-hint">An image is attached. Select a new image to replace it, or clear it below.</p><button v-if="itemImageId" type="button" class="text-button danger-text" @click="itemImageId = null; itemImage = null">Remove image</button>
               <p v-if="itemError" class="error-text" role="alert">{{ itemError }}</p><div class="form-actions"><button type="button" class="text-button" @click="clearItemForm">Cancel</button><button class="primary-button" :disabled="saving || snapshotMutationPending || !itemTitle.trim()">Save item</button></div>
             </form>
+            <p v-if="reorderAnnouncement" class="sr-only" role="status" aria-live="polite">{{ reorderAnnouncement }}</p>
             <template v-if="activeList.mode === 'status'">
               <section v-for="stage in manualStages" :key="stage.id ?? 'unassigned-stage'" class="manual-stage" :aria-labelledby="`manual-stage-${stage.id ?? 'unassigned'}`">
                 <h3 :id="`manual-stage-${stage.id ?? 'unassigned'}`">{{ stage.title }}</h3>
-                <div v-if="stage.items.length" class="list-grid"><article v-for="(item, index) in stage.items" :key="item.id" class="list-card"><a class="item-open" :href="detailPath(item)" @click="followRoute($event, detailPath(item))"><strong>{{ item.title }}</strong><small v-if="item.date">{{ dateLabel(item) }}</small></a><div class="list-actions"><button class="text-button" :disabled="snapshotMutationPending || index === 0" :aria-label="`Move ${item.title} earlier in ${stage.title}`" @click="moveManualItem(item, -1)">↑</button><button class="text-button" :disabled="snapshotMutationPending || index === stage.items.length - 1" :aria-label="`Move ${item.title} later in ${stage.title}`" @click="moveManualItem(item, 1)">↓</button><button class="text-button" :disabled="snapshotMutationPending" @click="editItem(item)">Edit</button><button class="text-button danger-text" :disabled="snapshotMutationPending" @click="removeItem(item)">Delete</button></div></article></div>
+                <div v-if="stage.items.length" class="list-grid" @pointermove="updateManualDrag(stage, $event)" @pointerup="finishManualDrag(stage)" @pointercancel="cancelManualDrag"><article v-for="(item, index) in stage.items" :key="item.id" class="list-card manual-item-card" :class="{ 'is-dragging': draggingItemId === item.id, 'drop-target': dragTargetIndex === index && draggingItemId !== item.id }" :data-item-id="item.id" :data-manual-item-index="index"><div class="manual-item-heading"><button type="button" class="drag-handle" :disabled="snapshotMutationPending || stage.items.length < 2" :aria-label="`Drag ${item.title} to reorder within ${stage.title}`" title="Drag to reorder" @pointerdown="startManualDrag(item, index, $event)" @pointerup="finishManualDrag(stage)" @pointercancel="cancelManualDrag">⠿</button><a class="item-open" :href="detailPath(item)" @click="followRoute($event, detailPath(item))"><strong>{{ item.title }}</strong><small v-if="item.date">{{ dateLabel(item) }}</small></a></div><div class="list-actions"><button class="text-button" :disabled="snapshotMutationPending || index === 0" :aria-label="`Move ${item.title} earlier in ${stage.title}`" @click="moveManualItem(item, -1)">↑</button><button class="text-button" :disabled="snapshotMutationPending || index === stage.items.length - 1" :aria-label="`Move ${item.title} later in ${stage.title}`" @click="moveManualItem(item, 1)">↓</button><button class="text-button" :disabled="snapshotMutationPending" @click="editItem(item)">Edit</button><button class="text-button danger-text" :disabled="snapshotMutationPending" @click="removeItem(item)">Delete</button></div></article></div>
                 <p v-else class="quiet-count">No items in this stage.</p>
               </section>
             </template>
-            <div v-else-if="activeItems.length" class="list-grid"><article v-for="item in activeItems" :key="item.id" class="list-card"><a class="item-open" :href="detailPath(item)" @click="followRoute($event, detailPath(item))"><strong>{{ item.title }}</strong><small v-if="item.date || activeList.mode === 'date'">{{ dateLabel(item) }}</small></a><div class="list-actions"><template v-if="!item.date"><button class="text-button" :disabled="snapshotMutationPending || undatedItems[0]?.id === item.id" :aria-label="`Move ${item.title} earlier among undated items`" @click="moveUndatedItem(item, -1)">↑</button><button class="text-button" :disabled="snapshotMutationPending || undatedItems[undatedItems.length - 1]?.id === item.id" :aria-label="`Move ${item.title} later among undated items`" @click="moveUndatedItem(item, 1)">↓</button></template><button class="text-button" :disabled="snapshotMutationPending" @click="editItem(item)">Edit</button><button class="text-button danger-text" :disabled="snapshotMutationPending" @click="removeItem(item)">Delete</button></div></article></div>
-            <p v-else-if="!editingItemId" class="quiet-count">No items yet. Add one to get started.</p>
+            <template v-else>
+              <p class="form-hint date-order-note">Dated items are ordered by date and time automatically. Only items without a date can be reordered manually.</p>
+              <section v-for="section in dateItemSections" :key="section.id" class="date-item-section" :aria-labelledby="`date-section-${section.id}`">
+                <h3 :id="`date-section-${section.id}`">{{ section.title }}</h3>
+                <div v-if="section.items.length" class="list-grid"><article v-for="item in section.items" :key="item.id" class="list-card"><a class="item-open" :href="detailPath(item)" @click="followRoute($event, detailPath(item))"><strong>{{ item.title }}</strong><small>{{ dateLabel(item) }}</small></a><div class="list-actions"><template v-if="!item.date"><button class="text-button" :disabled="snapshotMutationPending || undatedItems[0]?.id === item.id" :aria-label="`Move ${item.title} earlier among undated items`" @click="moveUndatedItem(item, -1)">↑</button><button class="text-button" :disabled="snapshotMutationPending || undatedItems[undatedItems.length - 1]?.id === item.id" :aria-label="`Move ${item.title} later among undated items`" @click="moveUndatedItem(item, 1)">↓</button></template><button class="text-button" :disabled="snapshotMutationPending" @click="editItem(item)">Edit</button><button class="text-button danger-text" :disabled="snapshotMutationPending" @click="removeItem(item)">Delete</button></div></article></div>
+                <p v-else class="quiet-count">No {{ section.id }} items.</p>
+              </section>
+            </template>
           </template><p v-else class="message-card">This list could not be found.</p>
         </section>
         <section v-else-if="route.name === 'item-detail'" class="message-card">

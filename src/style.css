@@ -219,3 +219,29 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
   .home-item-rail { margin-inline: 0; padding-inline: 2px; scroll-padding-inline: 2px; }
   .home-item-card { flex-basis: 192px; }
 }
+
+.list-settings { display: grid; gap: 10px; margin-bottom: 18px; padding: 16px; border: 1px solid #e5ebe6; border-radius: 16px; background: #fbfcfb; }
+.list-settings h2 { margin: 0; font-size: 1.05rem; }
+.list-settings label { display: grid; gap: 6px; color: #34433c; font-weight: 650; }
+.list-settings input { width: 100%; min-width: 0; min-height: 44px; padding: 9px 11px; border: 1px solid #ccd7cf; border-radius: 9px; color: #172321; background: white; }
+.list-settings > .text-button { justify-self: start; }
+.list-settings .confirm-box { position: fixed; inset: 50% auto auto 50%; width: min(440px, calc(100vw - 24px)); max-width: none; margin: 0; transform: translate(-50%, -50%); }
+.list-settings .confirm-box::backdrop { background: rgb(23 35 33 / 38%); }
+.date-order-note { margin: 4px 0 0; padding: 11px 13px; border-radius: 10px; background: #f1f5f2; }
+.date-item-section + .date-item-section { margin-top: 24px; }
+.date-item-section h3 { margin: 18px 0 10px; }
+.manual-item-card { transition: border-color 120ms ease, transform 120ms ease, opacity 120ms ease; }
+.manual-item-heading { display: grid; grid-template-columns: 38px minmax(0, 1fr); align-items: start; gap: 8px; }
+.manual-item-heading .item-open { min-width: 0; padding-block: 6px; overflow-wrap: anywhere; }
+.drag-handle { display: grid; width: 38px; min-height: 42px; place-items: center; padding: 0; border: 1px solid #d9e2dc; border-radius: 9px; color: #507b69; background: #f6f8f6; font-size: 1.3rem; cursor: grab; touch-action: none; user-select: none; }
+.drag-handle:active { cursor: grabbing; }
+.drag-handle:disabled { opacity: .45; cursor: not-allowed; }
+.manual-item-card.is-dragging { z-index: 1; opacity: .55; border-color: #579079; }
+.manual-item-card.drop-target { border-color: #579079; box-shadow: 0 0 0 2px #57907930; }
+.manual-item-card .list-actions { flex-wrap: wrap; }
+@media (max-width: 380px) {
+  .list-settings { padding: 13px; }
+  .manual-item-card { padding: 13px; }
+  .manual-item-card .list-actions { gap: 4px; }
+  .manual-item-card .text-button { min-width: 40px; padding-inline: 8px; }
+}
