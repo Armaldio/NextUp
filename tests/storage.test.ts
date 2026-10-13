@@ -101,6 +101,70 @@ test('supports per-list stage CRUD and persists arbitrary stage ordering', async
   assert.deepEqual(loaded.items, sampleData.items)
 })
 
+test('reorders items within their manual stage and persists stable first and last positions', async () => {
+  const driver = new MemoryDriver()
+  const repository = new LocalDataRepository(driver)
+  const { date: _date, ...undatedSampleItem } = sampleData.items[0]!
+  const data: AppData = {
+    ...sampleData,
+    statuses: [
+      { id: 'status-1', listId: 'list-1', title: 'To read', order: 0 },
+      { id: 'status-2', listId: 'list-1', title: 'Done', order: 1 },
+      { id: 'status-3', listId: 'list-1', title: 'Later', order: 2 },
+    ],
+    items: [
+      { ...sampleData.items[0]!, id: 'first', title: 'First', position: 0 },
+      { ...sampleData.items[0]!, id: 'middle', title: 'Middle', position: 1 },
+      { ...undatedSampleItem, id: 'last', title: 'Last', position: 2, imageId: null },
+      { ...sampleData.items[0]!, id: 'other-stage', title: 'Other stage', position: 3, statusId: 'status-2', imageId: null },
+    ],
+  }
+  const image = new Blob(['cover'], { type: 'image/png' })
+  await repository.save(data, new Map([['image-1', image]]))
+
+  await repository.reorderManualStageItems('list-1', 'status-1', ['last', 'middle', 'first'])
+
+  const reloaded = await new LocalDataRepository(driver).load()
+  assert.deepEqual(reloaded.items.filter((item) => item.statusId === 'status-1').sort((a, b) => a.position - b.position).map((item) => item.id), ['last', 'middle', 'first'])
+  assert.deepEqual(reloaded.items.map(({ id, statusId, date }) => [id, statusId, date]), data.items.map(({ id, statusId, date }) => [id, statusId, date]))
+  assert.deepEqual(reloaded.items.find((item) => item.id === 'middle'), data.items.find((item) => item.id === 'middle'))
+  assert.equal(await (await new LocalDataRepository(driver).getImage('image-1'))?.text(), 'cover')
+})
+
+test('manual reordering accepts an empty stage and the unassigned group', async () => {
+  const driver = new MemoryDriver()
+  const repository = new LocalDataRepository(driver)
+  await repository.save(sampleData, new Map([['image-1', new Blob(['image'])]]))
+
+  await repository.reorderManualStageItems('list-1', 'status-2', [])
+  await repository.reorderManualStageItems('list-1', null, [])
+
+  assert.deepEqual(await repository.load(), sampleData)
+})
+
+test('changing status explicitly appends to the destination stage and preserves item data', async () => {
+  const driver = new MemoryDriver()
+  const repository = new LocalDataRepository(driver)
+  const { date: _date, ...undatedSampleItem } = sampleData.items[0]!
+  const items = [
+    { ...sampleData.items[0]!, id: 'moving', position: 0 },
+    { ...undatedSampleItem, id: 'destination-first', position: 1, statusId: 'status-2', imageId: null },
+  ]
+  await repository.save({ ...sampleData, statuses: [...sampleData.statuses, { id: 'status-3', listId: 'list-1', title: 'Empty', order: 2 }], items }, new Map([['image-1', new Blob(['cover'], { type: 'image/png' })]]))
+
+  await repository.saveItem({ ...items[0]!, statusId: 'status-2' })
+
+  const reloaded = await new LocalDataRepository(driver).load()
+  const destination = reloaded.items.filter((item) => item.statusId === 'status-2').sort((a, b) => a.position - b.position)
+  assert.deepEqual(destination.map((item) => item.id), ['destination-first', 'moving'])
+  assert.deepEqual(reloaded.items.find((item) => item.id === 'moving'), { ...items[0], position: destination[1]!.position, statusId: 'status-2' })
+
+  await repository.saveItem({ ...reloaded.items.find((item) => item.id === 'moving')!, statusId: 'status-3' })
+  const movedIntoEmptyStage = await new LocalDataRepository(driver).load()
+  assert.deepEqual(movedIntoEmptyStage.items.filter((item) => item.statusId === 'status-3').map((item) => item.id), ['moving'])
+  assert.equal(await (await new LocalDataRepository(driver).getImage('image-1'))?.text(), 'cover')
+})
+
 test('stage removal requires reassignment and preserves every item field and position', async () => {
   const driver = new MemoryDriver()
   const repository = new LocalDataRepository(driver)

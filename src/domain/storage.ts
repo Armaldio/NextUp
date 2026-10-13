@@ -63,9 +63,12 @@ export class LocalDataRepository {
       const list = current.lists.find((entry) => entry.id === item.listId)
       if (!list) throw new InvalidDataError(`Item ${item.id} refers to a missing list`)
       const previous = current.items.find((entry) => entry.id === item.id)
+      const movingToAnotherStage = previous !== undefined && previous.statusId !== item.statusId
       const prepared: Item = {
         ...item,
-        position: previous?.position ?? Math.max(-1, ...current.items.filter((entry) => entry.listId === item.listId).map((entry) => entry.position)) + 1,
+        position: movingToAnotherStage || !previous
+          ? Math.max(-1, ...current.items.filter((entry) => entry.listId === item.listId).map((entry) => entry.position)) + 1
+          : previous.position,
       }
       const next = validateAppData({ ...current, items: previous
         ? current.items.map((entry) => entry.id === item.id ? prepared : entry)
@@ -140,6 +143,34 @@ export class LocalDataRepository {
     const positionById = new Map(orderedItemIds.map((id, index) => [id, availablePositions[index]]))
     const items = current.items.map((item) => positionById.has(item.id) ? { ...item, position: positionById.get(item.id)! } : item)
     await this.writeCurrent({ ...current, items }, 'reorder undated items')
+  }
+
+  async reorderManualStageItems(listId: string, statusId: string | null, orderedItemIds: readonly string[]): Promise<void> {
+    const current = await this.readCurrent('reorder manual items')
+    const list = current.lists.find((entry) => entry.id === listId)
+    if (!list || list.mode !== 'status') throw new StorageError('Only manual lists can reorder stage items')
+    if (statusId !== null && !current.statuses.some((status) => status.id === statusId && status.listId === listId)) {
+      throw new StorageError('Choose a stage in this manual list')
+    }
+
+    const stageItems = current.items.filter((item) => item.listId === listId && item.statusId === statusId)
+    const expectedIds = new Set(stageItems.map((item) => item.id))
+    if (orderedItemIds.length !== stageItems.length || new Set(orderedItemIds).size !== orderedItemIds.length || orderedItemIds.some((id) => !expectedIds.has(id))) {
+      throw new StorageError('Reorder must include every item in this stage')
+    }
+    if (orderedItemIds.length === 0) return
+
+    const stageOrder = current.statuses.filter((status) => status.listId === listId).sort((a, b) => a.order - b.order).map((status) => status.id)
+    const positionById = new Map<string, number>()
+    let position = 0
+    for (const stageId of [...stageOrder, null]) {
+      const ids = stageId === statusId
+        ? orderedItemIds
+        : current.items.filter((item) => item.listId === listId && item.statusId === stageId).sort((a, b) => a.position - b.position).map((item) => item.id)
+      for (const id of ids) positionById.set(id, position++)
+    }
+    const items = current.items.map((item) => positionById.has(item.id) ? { ...item, position: positionById.get(item.id)! } : item)
+    await this.writeCurrent({ ...current, items }, 'reorder manual items')
   }
 
   private async readCurrent(action: string): Promise<AppData> {
